@@ -101,7 +101,7 @@ type Client struct {
 	verbose      bool
 	mainAsm      channelAsm // per-channel assembly state for ch=0x05
 	subAsm       channelAsm // per-channel assembly state for ch=0x07
-	gopPoisoned  bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
+	gopPoisoned  bool   // a fragment was lost in this GOP — drop P-frames until next clean IDR
 	lastPFrameTs uint32 // last P-frame's trailer ts (kept for legacy callers)
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
@@ -944,7 +944,7 @@ func (c *Client) emit(e *pendingFrag) {
 	asm.reset()
 	asm.curFrameNum = 0
 
-	if c.strict && gapped {
+	if gapped {
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
@@ -954,44 +954,47 @@ func (c *Client) emit(e *pendingFrag) {
 	if !wasMain {
 		c.lastPFrameTs = frameTs
 	}
-	// In strict mode, drop P-frames in a poisoned GOP until the next
-	// IDR resyncs us.  emitAU resets gopPoisoned when it sees an IDR.
-	if c.strict && c.gopPoisoned && !wasMain {
+	// Drop P-frames in a poisoned GOP until the next clean IDR.
+	// Decoder has no valid reference frame for them.  emitAU resets
+	// gopPoisoned when it sees an IDR.
+	if c.gopPoisoned && !wasMain {
 		c.stats.vidDropped++
 		return
 	}
 	c.emitAU(au)
 }
 
-// flushMainIDR emits the accumulated ch=0x05 IDR buffer as an AU.
-// Called from emit() when a ch=0x07 P-frame arrives — on the firmware
-// where ch=0x05 IDRs have no end-fragment, this cross-channel signal
-// is the only completion indicator we get.  PTS comes from the
-// following P-frame's trailer minus one frame interval (40 ms @ 25 fps).
+// flushMainIDR handles a pending ch=0x05 IDR buffer when a ch=0x07
+// P-frame arrives.  Fires when the IDR's end-fragment never arrived
+// (the b1=0x05 fragIdx=16 fragment with the K-variant trailer carries
+// the last ~300 bytes of the IDR slice).  PTS is derived from the
+// next P-frame's trailer minus one frame interval (40 ms @ 25 fps).
+//
+// In strict mode we DROP these IDRs since the slice is truncated and
+// the decoder will throw "out of range intra chroma pred mode" / MB
+// row 66-67 errors.  In non-strict mode we emit anyway — better one
+// IDR's worth of bottom-row corruption than a multi-second black hole
+// while we wait for an end-fragment-complete IDR.
 func (c *Client) flushMainIDR(nextPFrameTs uint32) {
+	if len(c.mainAsm.buf) == 0 {
+		c.mainAsm.reset()
+		c.mainAsm.curFrameNum = 0
+		return
+	}
 	au := append([]byte(nil), c.mainAsm.buf...)
-	gapped := c.mainAsm.curAUGapped
-	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount < c.mainAsm.curAUTotal {
-		// We never reached inner[20]'s advertised total; tail data
-		// fragments may have been lost (or the firmware doesn't send
-		// the end fragment at all for some IDR sizes — both lead to a
-		// truncated slice).
+	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount+1 < c.mainAsm.curAUTotal {
 		c.stats.fragSkips++
-		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - c.mainAsm.curAUDataCount)
-		gapped = true
+		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount)
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
-	if len(au) == 0 {
-		return
-	}
-	if c.strict && gapped {
+	if c.strict {
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
 	}
 	if nextPFrameTs != 0 {
-		idrTs := nextPFrameTs - 40 // assume 1 frame @ 25 fps lead
+		idrTs := nextPFrameTs - 40
 		c.pendingFrameTs = idrTs
 		c.havePendingTs = true
 	}
@@ -1007,16 +1010,14 @@ func (c *Client) emitAU(au []byte) {
 	if c.emitDumpFile != nil {
 		_, _ = c.emitDumpFile.Write(au)
 	}
-	if c.strict {
-		if isKey {
-			// IDR is a fresh start — the GOP is no longer poisoned.
-			c.gopPoisoned = false
-		} else if c.gopPoisoned {
-			// P-frame in a poisoned GOP — drop silently.  Decoder
-			// gets pristine pixels until the next IDR resyncs.
-			c.stats.vidDropped++
-			return
-		}
+	if isKey {
+		// A fresh IDR clears the GOP-poisoned state.
+		c.gopPoisoned = false
+	} else if c.gopPoisoned {
+		// P-frame referencing a dropped IDR — decoder has no valid
+		// reference, would render garbage.  Drop until next IDR.
+		c.stats.vidDropped++
+		return
 	}
 
 	// PTS comes from the camera's own millisecond clock embedded in
