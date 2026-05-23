@@ -838,24 +838,40 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.stats.vidFrags++
 
-	// This firmware sends BOTH ~16-fragment SD IDRs (640x368 baseline
-	// level 3.0) AND ~75-fragment HD IDRs (1920x1088 baseline level
-	// 4.1) interleaved on ch=0x05.  The two resolutions confuse the
-	// downstream decoder (it locks onto whichever SPS arrives first
-	// and renders the other resolution with corrupt artifacts).
-	// Filter on inner[20] (total fragments) to keep only the size
-	// matching the configured quality.  ch=0x07 P-frames (f20=1) are
-	// always kept; they encode at whichever resolution is active.
+	// Camera concurrently sends two video streams (HD = stream_id 0x01,
+	// SD = stream_id 0x02) over ch=0x05 (IDR data) + ch=0x07 (P-frames).
+	// They interleave in wire order; if we don't filter one out the
+	// downstream decoder gets a mix and renders the wrong-resolution
+	// frames with scattered MB-level decoder errors.
 	//
-	// Threshold of 30 fragments is empirically half-way between the
-	// observed SD size (12-16 frags) and HD size (70-78 frags).
+	// Filter strategy:
+	//
+	// * ch=0x05 IDR fragments don't carry a per-fragment stream id
+	//   (only the end-fragment's trailer does).  Use inner[20]
+	//   (total fragment count) as a size-based discriminator:
+	//   ~12-16 frags = SD, ~70-78 frags = HD.  Threshold = 30.
+	//
+	// * ch=0x07 P-frames are single-fragment with a trailer; check
+	//   the trailer's stream id byte directly.
+	wantStreamID := byte(0x01) // HD = main stream by default
+	if c.quality == "sd" {
+		wantStreamID = 0x02 // SD = sub stream
+	}
 	if e.channel == innerChMain && e.totalFrags > 0 {
 		isBigIDR := e.totalFrags >= 30
-		wantBig := c.quality != "sd" // default = "hd"
+		wantBig := wantStreamID == 0x01
 		if isBigIDR != wantBig {
 			return
 		}
 	}
+	// Note: we deliberately do NOT filter ch=0x07 P-frames by trailer
+	// stream-id.  The camera in SD mode appears to still send many
+	// HD-encoded P-frames on ch=0x07 (with trailer stream_id=0x01).
+	// Dropping them leaves so few SD P-frames that mpv can't decode
+	// any GOP — the SD IDR has no following P-frames at all.
+	// Instead we accept all ch=0x07 fragments and let the SD decoder
+	// cope with the occasional HD-sized P-slice it can't decode.
+	_ = wantStreamID
 
 	// This firmware variant:
 	//   ch=0x05 IDR fragments arrive WITHOUT a trailer-bearing end
@@ -1092,12 +1108,15 @@ func (c *Client) emitAU(au []byte) {
 //	IDR/key:  4e  00 <p_or_k> 00 <stream_id>  00*7  <ts>
 //
 // codec_id is 0x4e (= CodecH264) for video.  Byte 1 of the variant
-// prefix is 0x00 for P-frames and 0x01 for IDR keyframes.  Byte 3 is
-// a small non-zero stream identifier — observed values:
-//   * 0x01 — PCAPdroid pcap recording (different camera firmware)
-//   * 0x02 — current live PLAF203 firmware
-// We accept any small (1..15) value at byte 3 so we don't get bitten
-// the next time the camera firmware reassigns the id.
+// prefix is 0x00 for P-frames and 0x01 for IDR keyframes.  Byte 3
+// (last byte of the variant prefix) is the STREAM ID:
+//
+//	0x01 = main stream (HD on this camera, 1920x1080)
+//	0x02 = sub stream  (SD on this camera, 640x360)
+//
+// The camera concurrently sends BOTH streams; the configured Quality
+// option picks which one to keep — see streamIDFromTrailer() and the
+// filter at the top of emit().
 //
 // Stripping only 15 trailer bytes would leave the 0x4e codec_id in
 // the slice tail; decoders read it as a stray NAL-14 prefix and bail
