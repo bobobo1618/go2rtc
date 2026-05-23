@@ -70,14 +70,6 @@ func NewProducer(rawURL string) (*Producer, error) {
 }
 
 func (p *Producer) Start() error {
-	// probe() consumed (but did not forward) the first IDR — it
-	// extracted the SPS from it and dropped the packet.  If we let
-	// the FIRST P-frame after that reach receivers, the decoder will
-	// reference an IDR it never saw and cascade "mb_skip_run invalid"
-	// errors until the next IDR (often >2 s later).  Hold every
-	// H.264 packet back until the first keyframe arrives, so the
-	// downstream decoder always has a valid reference frame.
-	keyframeSeen := false
 	for {
 		_ = p.client.SetDeadline(time.Now().Add(core.ConnDeadline))
 		pkt, err := p.client.ReadPacket()
@@ -93,12 +85,6 @@ func (p *Producer) Start() error {
 
 		switch pkt.Codec {
 		case CodecH264:
-			if !keyframeSeen {
-				if !pkt.IsKeyframe {
-					continue
-				}
-				keyframeSeen = true
-			}
 			name = core.CodecH264
 			avcc := annexb.EncodeToAVCC(pkt.Payload)
 			if len(avcc) < 5 {
