@@ -971,10 +971,17 @@ func (c *Client) emit(e *pendingFrag) {
 
 // flushMainIDR emits the accumulated ch=0x05 IDR buffer when a
 // ch=0x07 P-frame arrives without us having seen the IDR's
-// end-fragment.  PTS = next P-frame's trailer minus one frame
-// interval (40 ms @ 25 fps).  In strict mode the partial IDR is
-// dropped instead (its slice is truncated and the decoder will
-// throw bottom-MB-row errors).
+// end-fragment.  The IDR's last ~300 bytes (the bottom MB rows on
+// HD) are in that end-fragment, so the slice we have is truncated.
+//
+// Behaviour mirrors pkg/tutk's handleVideo discipline:
+//   * if a MID-frame fragment was lost (fragIdx gap) — DROP, because
+//     the slice has a hole somewhere in the middle and decoder errors
+//     scatter across the whole frame
+//   * if only the trailing end-fragment was lost (no mid gaps) —
+//     emit in non-strict mode, drop in strict mode.  ffmpeg tolerates
+//     a slice truncated at the very end with minor MB row 66-67
+//     artifacts; the alternative is a multi-second video gap.
 func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	if len(c.mainAsm.buf) == 0 {
 		c.mainAsm.reset()
@@ -982,17 +989,21 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 		return
 	}
 	au := append([]byte(nil), c.mainAsm.buf...)
+	midGapped := c.mainAsm.curAUGapped
+	tailMissing := false
 	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount+1 < c.mainAsm.curAUTotal {
+		tailMissing = true
 		c.stats.fragSkips++
 		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount)
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
-	if c.strict {
+	if midGapped || c.strict {
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
 	}
+	_ = tailMissing
 	if nextPFrameTs != 0 {
 		idrTs := nextPFrameTs - 40
 		c.pendingFrameTs = idrTs
