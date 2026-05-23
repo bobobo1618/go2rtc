@@ -37,6 +37,7 @@ func NewProducer(rawURL string) (*Producer, error) {
 		Audio:      q.Get("audio") == "true" || q.Get("audio") == "1",
 		Quality:    q.Get("quality"),
 		DisableSub: q.Get("disable_sub") == "true" || q.Get("disable_sub") == "1",
+		Strict:     q.Get("strict") == "true" || q.Get("strict") == "1",
 		Verbose:    q.Get("verbose") == "true" || q.Get("verbose") == "1",
 	}
 	if opts.UID == "" {

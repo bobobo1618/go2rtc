@@ -50,6 +50,7 @@ type DialOptions struct {
 	Audio      bool
 	Quality    string // "hd" (default) or "sd"
 	DisableSub bool   // experimental: try to make the camera stop dual-streaming
+	Strict     bool   // drop the entire GOP if any fragment was lost — pristine pixels
 	Verbose    bool
 }
 
@@ -88,6 +89,7 @@ type Client struct {
 	audio           bool
 	quality         string
 	disableSub      bool
+	strict          bool
 	verbose         bool
 	videoChannel    byte   // inner-channel byte of the video stream we consume
 	curFrameNum     uint32 // camera frame counter of the AU currently being assembled
@@ -95,6 +97,8 @@ type Client struct {
 	curAUWasKeyframe bool   // current AU begins with SPS (drop on loss to avoid GOP poison)
 	expectFragIdx    uint16 // next frag_idx we expect within the current frame
 	bufHigh          int    // diag: largest curBuf seen since last emit
+	gopPoisoned      bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
+	curFrameGapped   bool   // strict mode: a forward frag_idx jump happened in the current frame
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it
@@ -201,6 +205,7 @@ func Dial(opts DialOptions) (*Client, error) {
 		audio:        opts.Audio,
 		quality:      opts.Quality,
 		disableSub:   opts.DisableSub,
+		strict:       opts.Strict,
 		verbose:      opts.Verbose,
 		videoChannel: videoChan,
 		frames:       make(chan *Packet, 256),
@@ -794,29 +799,85 @@ func (c *Client) emit(e *pendingFrag) {
 		c.expectFragIdx = 0
 	}
 	c.curFrameNum = e.frameNum
-	if e.fragIdx != c.expectFragIdx {
-		c.stats.fragSkips++
-		if e.fragIdx > c.expectFragIdx {
-			c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
-		}
-	}
-	c.expectFragIdx = e.fragIdx + 1
-
 	payload, frameTs, hasTs := stripFragmentMetadataTrailer(e.payload)
+
 	if hasTs {
-		// The trailer marks "end of frame N" — use its millisecond
-		// counter as PTS for the next AU we emit (which contains the
-		// bytes from the previous trailer up to now).
 		c.pendingFrameTs = frameTs
 		c.havePendingTs = true
+		// Trailer fragments use frag_idx as an end-marker, not a
+		// sequential index — don't run gap detection on them.
+	} else {
+		// frag_idx resets at every H.264 frame boundary.
+		switch {
+		case e.fragIdx < c.expectFragIdx:
+			// New frame starting.  In strict mode, if the previous
+			// frame was still being assembled (we never saw its
+			// trailer), discard it — it was truncated by loss.
+			if c.strict && len(c.curBuf) > 0 {
+				c.stats.vidDropped++
+				c.curBuf = c.curBuf[:0]
+			}
+			c.curFrameGapped = false
+			// And: if the new frame's first fragment we see is NOT
+			// frag_idx=0, we missed its start — mark this frame
+			// gapped too.
+			if e.fragIdx > 0 {
+				c.stats.fragSkips++
+				c.stats.fragsLost += uint64(e.fragIdx)
+				if c.strict {
+					c.curFrameGapped = true
+				}
+			}
+		case e.fragIdx > c.expectFragIdx:
+			// Forward jump = UDP loss inside a frame.
+			c.stats.fragSkips++
+			c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+			if c.strict {
+				c.curFrameGapped = true
+			}
+		}
+		c.expectFragIdx = e.fragIdx + 1
 	}
+
 	if c.dumpFile != nil {
 		_, _ = c.dumpFile.Write(payload)
 	}
 	c.curBuf = append(c.curBuf, payload...)
-	// AU boundaries come from scanning the byte stream for a NEW
-	// access-unit-starting NAL — SPS (7) for keyframes, P-slice (1)
-	// for non-IDR pictures.
+
+	if c.strict {
+		// Trailer-aligned per-frame emission.  If a frame had a gap,
+		// poison the whole GOP — every subsequent P-frame would have
+		// broken references back to the dropped frame, producing
+		// cascading decoder errors.  Resume emission at the next IDR.
+		if hasTs {
+			frameIsKey := containsNALType(c.curBuf, 5)
+			if frameIsKey {
+				// Fresh IDR clears any prior poison — the next GOP
+				// can be decoded on its own.
+				c.gopPoisoned = c.curFrameGapped
+			} else if c.curFrameGapped {
+				c.gopPoisoned = true
+			}
+			if c.gopPoisoned {
+				c.stats.vidDropped++
+				c.curBuf = c.curBuf[:0]
+			} else if len(c.curBuf) > 0 {
+				c.emitAU(append([]byte(nil), c.curBuf...))
+				c.curBuf = c.curBuf[:0]
+			}
+			c.curFrameGapped = false
+			c.expectFragIdx = 0
+		}
+		return
+	}
+
+	// Loose mode: byte-scan for AU boundaries.  This emits a
+	// frame as soon as the next slice's start code arrives, so we
+	// get higher fps under loss but propagate decoder errors when
+	// a fragment is missing.
+	if hasTs {
+		c.expectFragIdx = 0
+	}
 	c.tryEmitAU()
 }
 
@@ -897,6 +958,17 @@ func (c *Client) emitAU(au []byte) {
 		return
 	}
 	isKey := containsNALType(au, 5)
+	if c.strict {
+		if isKey {
+			// IDR is a fresh start — the GOP is no longer poisoned.
+			c.gopPoisoned = false
+		} else if c.gopPoisoned {
+			// P-frame in a poisoned GOP — drop silently.  Decoder
+			// gets pristine pixels until the next IDR resyncs.
+			c.stats.vidDropped++
+			return
+		}
+	}
 
 	// PTS comes from the camera's own millisecond clock embedded in
 	// the metadata trailer of each frame's last fragment.  This gives
