@@ -99,7 +99,6 @@ type Client struct {
 	disableSub     bool
 	strict         bool
 	verbose        bool
-	videoChannel   byte   // inner-channel byte of the video stream we consume
 	curFrameNum    uint32 // camera frame counter of the AU currently being assembled
 	curAUTotal     uint16 // inner[20]: total fragments advertised for the current frame
 	curAUDataCount uint16 // count of fragIdx<16 fragments received for current frame
@@ -132,7 +131,7 @@ type counters struct {
 	subFrags     uint64 // fragments on channel 0x07 (SD video)
 	audioFrags   uint64 // fragments on channel 0x03
 	otherFrags   uint64 // anything else (control, etc.)
-	vidFrags     uint64 // video fragments (matching videoChannel) reaching emit
+	vidFrags     uint64 // video fragments (ch=0x05 + ch=0x07) reaching emit
 	vidFramesIn  uint64 // distinct frame_num values seen on video channel
 	vidFramesOut uint64 // AUs successfully queued to consumers
 	vidDropped   uint64 // AUs discarded because a frag_idx gap was detected
@@ -201,23 +200,18 @@ func Dial(opts DialOptions) (*Client, error) {
 		_ = udp.Close()
 		return nil, err
 	}
-	videoChan := innerChMain
-	if opts.Quality == "sd" {
-		videoChan = innerChSub
-	}
 	c := &Client{
-		conn:         udp,
-		cam:          cam,
-		uid:          opts.UID,
-		nonce:        nonce,
-		kseq:         2,
-		audio:        opts.Audio,
-		quality:      opts.Quality,
-		disableSub:   opts.DisableSub,
-		strict:       opts.Strict,
-		verbose:      opts.Verbose,
-		videoChannel: videoChan,
-		frames:       make(chan *Packet, 256),
+		conn:       udp,
+		cam:        cam,
+		uid:        opts.UID,
+		nonce:      nonce,
+		kseq:       2,
+		audio:      opts.Audio,
+		quality:    opts.Quality,
+		disableSub: opts.DisableSub,
+		strict:     opts.Strict,
+		verbose:    opts.Verbose,
+		frames:     make(chan *Packet, 256),
 	}
 	if path := os.Getenv("PETLIBRO_DUMP_VIDEO"); path != "" {
 		if f, ferr := os.Create(path); ferr == nil {
@@ -808,6 +802,13 @@ func (c *Client) emit(e *pendingFrag) {
 	if e.channel != innerChMain && e.channel != innerChSub {
 		return
 	}
+	// Per live capture (HD config): ch=0x05 carries IDR keyframes
+	// (multi-fragment, every ~60 frames), ch=0x07 carries P-frames
+	// (single fragment each).  They share the same frame_num counter,
+	// so the two channels together describe ONE stream — accept both
+	// regardless of opts.Quality.  We handle them differently below:
+	// ch=0x05 fragments accumulate; ch=0x07 single fragments emit
+	// immediately (after flushing any pending IDR).
 	c.stats.vidFrags++
 
 	// New frame_num while we still have a partial buffer means the
