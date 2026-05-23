@@ -92,7 +92,24 @@ type Client struct {
 	curAUWasKeyframe bool   // current AU begins with SPS (drop on loss to avoid GOP poison)
 	expectFragIdx    uint16 // next frag_idx we expect within the current frame
 
+	stats     counters
+	prevStats counters
+
 	dumpFile *os.File // optional raw-stream dump for debugging
+}
+
+// counters holds running totals for a stream-health summary.
+type counters struct {
+	bytesIn      uint64 // bytes read from the UDP socket (encrypted)
+	pktsIn       uint64 // UDP datagrams successfully read
+	vidFrags     uint64 // video fragments (matching videoChannel) reaching emit
+	vidFramesIn  uint64 // distinct frame_num values seen on video channel
+	vidFramesOut uint64 // AUs successfully queued to consumers
+	vidDropped   uint64 // AUs discarded because a frag_idx gap was detected
+	fragSkips    uint64 // count of frag_idx-skip events (fragments lost on the wire)
+	fragsLost    uint64 // total fragments lost (sum of frag_idx gap sizes)
+	forceDrains  uint64 // times forceDrain ran with buffered packets to flush
+	recvTimeouts uint64 // SetReadDeadline-triggered timeouts (no UDP data)
 }
 
 type pendingFrag struct {
@@ -398,6 +415,7 @@ func (c *Client) bootstrap() error {
 func (c *Client) recvLoop() {
 	defer c.Close()
 	lastForce := time.Now()
+	lastStats := time.Now()
 	for {
 		c.closeMu.Lock()
 		done := c.closed
@@ -413,13 +431,49 @@ func (c *Client) recvLoop() {
 			return
 		}
 		if n > 0 {
+			c.stats.bytesIn += uint64(n)
+			c.stats.pktsIn++
 			c.handleIncoming(tutk.ReverseTransCodePartial(nil, buf[:n]))
+		} else if err != nil {
+			c.stats.recvTimeouts++
 		}
 		if time.Since(lastForce) > 500*time.Millisecond {
 			c.forceDrain()
 			lastForce = time.Now()
 		}
+		if c.verbose && time.Since(lastStats) > 5*time.Second {
+			c.dumpStats()
+			lastStats = time.Now()
+		}
 	}
+}
+
+// dumpStats prints a one-line stream-health summary every ~5 s when
+// the client is in verbose mode.  Numbers cover the most recent
+// interval; the cumulative counters are also visible.
+func (c *Client) dumpStats() {
+	s := &c.stats
+	delta := s
+	if c.prevStats.bytesIn > 0 {
+		// compute deltas
+		delta = &counters{
+			bytesIn:      s.bytesIn - c.prevStats.bytesIn,
+			pktsIn:       s.pktsIn - c.prevStats.pktsIn,
+			vidFrags:     s.vidFrags - c.prevStats.vidFrags,
+			vidFramesIn:  s.vidFramesIn - c.prevStats.vidFramesIn,
+			vidFramesOut: s.vidFramesOut - c.prevStats.vidFramesOut,
+			vidDropped:   s.vidDropped - c.prevStats.vidDropped,
+			fragSkips:    s.fragSkips - c.prevStats.fragSkips,
+			fragsLost:    s.fragsLost - c.prevStats.fragsLost,
+			forceDrains:  s.forceDrains - c.prevStats.forceDrains,
+			recvTimeouts: s.recvTimeouts - c.prevStats.recvTimeouts,
+		}
+	}
+	fmt.Printf("[petlibro/stats] in=%d pkts (%d KiB) | video: %d frags %d frames in -> %d out (drop %d) | frag skips: %d (%d frags lost) | forceDrain: %d\n",
+		delta.pktsIn, delta.bytesIn/1024,
+		delta.vidFrags, delta.vidFramesIn, delta.vidFramesOut, delta.vidDropped,
+		delta.fragSkips, delta.fragsLost, delta.forceDrains)
+	c.prevStats = *s
 }
 
 func (c *Client) maintenanceLoop() {
@@ -581,6 +635,10 @@ func (c *Client) forceDrain() {
 			keys = append(keys, k)
 		}
 	}
+	if len(keys) == 0 {
+		return
+	}
+	c.stats.forceDrains++
 	for i := 1; i < len(keys); i++ {
 		for j := i; j > 0 && keys[j-1] > keys[j]; j-- {
 			keys[j-1], keys[j] = keys[j], keys[j-1]
@@ -623,6 +681,7 @@ func (c *Client) emit(e *pendingFrag) {
 	if e.channel != c.videoChannel {
 		return
 	}
+	c.stats.vidFrags++
 	// Track wire-sequence contiguity across video fragments.  When
 	// forceDrain advances past lost fragments, the next video sub_ext
 	// will be more than ~jitter+audio_interleave fragments ahead of
@@ -638,6 +697,10 @@ func (c *Client) emit(e *pendingFrag) {
 	// We only DROP the IDR keyframe if it's incomplete, because a
 	// broken IDR poisons the entire GOP that follows.
 	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum {
+		c.stats.vidFramesIn++
+		if c.curAUIncomplete {
+			c.stats.vidDropped++
+		}
 		// Emit every frame — even partial ones.  Decoder concealment
 		// handles missing slices much better than total-frame loss,
 		// which creates a slideshow effect.
@@ -654,6 +717,10 @@ func (c *Client) emit(e *pendingFrag) {
 	// skip means UDP loss.
 	if e.fragIdx != c.expectFragIdx {
 		c.curAUIncomplete = true
+		c.stats.fragSkips++
+		if e.fragIdx > c.expectFragIdx {
+			c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+		}
 	}
 	c.expectFragIdx = e.fragIdx + 1
 	// First fragment of a frame whose payload begins with SPS (NAL=7)
@@ -687,6 +754,7 @@ func (c *Client) flushCurrentAU() {
 	au := c.curBuf
 	c.curBuf = nil
 	isKey := containsNALType(au, 5)
+	c.stats.vidFramesOut++
 
 	// Frame-based PTS: each AU is one frame at ~25 fps, monotonic
 	// regardless of host clock resolution.
