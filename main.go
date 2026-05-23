@@ -32,6 +32,7 @@ import (
 	"github.com/AlexxIT/go2rtc/internal/nest"
 	"github.com/AlexxIT/go2rtc/internal/ngrok"
 	"github.com/AlexxIT/go2rtc/internal/onvif"
+	"github.com/AlexxIT/go2rtc/internal/petlibro"
 	"github.com/AlexxIT/go2rtc/internal/pinggy"
 	"github.com/AlexxIT/go2rtc/internal/ring"
 	"github.com/AlexxIT/go2rtc/internal/roborock"
@@ -99,6 +100,7 @@ func main() {
 		{"ivideon", ivideon.Init},
 		{"kasa", kasa.Init},
 		{"mpegts", mpeg.Init},
+		{"petlibro", petlibro.Init},
 		{"multitrans", multitrans.Init},
 		{"nest", nest.Init},
 		{"ring", ring.Init},
