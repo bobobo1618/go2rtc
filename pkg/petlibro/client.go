@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -151,6 +152,19 @@ func Dial(opts DialOptions) (*Client, error) {
 	// only ~2 seconds of headroom and easily overflowed by a slow
 	// drain.  Ask for 4 MiB — the kernel will clamp if it can't.
 	_ = udp.SetReadBuffer(4 * 1024 * 1024)
+	if opts.Verbose {
+		// Verify what the kernel actually granted us — SetReadBuffer
+		// silently clamps and we want to know if we hit a cap.
+		if sc, err := udp.SyscallConn(); err == nil {
+			var actualBuf int
+			_ = sc.Control(func(fd uintptr) {
+				actualBuf, _ = syscall.GetsockoptInt(int(fd),
+					syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+			})
+			fmt.Printf("[petlibro] SO_RCVBUF requested=%d granted=%d\n",
+				4*1024*1024, actualBuf)
+		}
+	}
 
 	nonce := make([]byte, 8)
 	if _, err := rand.Read(nonce); err != nil {
@@ -412,10 +426,21 @@ func (c *Client) bootstrap() error {
 
 // --- worker loops --------------------------------------------------------
 
+// recvLoop runs two goroutines: a tight reader that does nothing but
+// drain the UDP socket into a channel, and a processor that decrypts
+// and dispatches.  Decoupling means a slow decrypt or GC pause can't
+// stall the read syscall and cause kernel UDP drops.
 func (c *Client) recvLoop() {
 	defer c.Close()
+
+	rawChan := make(chan []byte, 1024) // ~1 MiB at peak packet sizes
+	go c.readerGoroutine(rawChan)
+
 	lastForce := time.Now()
 	lastStats := time.Now()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+
 	for {
 		c.closeMu.Lock()
 		done := c.closed
@@ -424,19 +449,18 @@ func (c *Client) recvLoop() {
 			return
 		}
 
-		_ = c.conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-		buf := make([]byte, 65535)
-		n, _, err := c.conn.ReadFromUDP(buf)
-		if err != nil && !isTimeout(err) {
-			return
-		}
-		if n > 0 {
-			c.stats.bytesIn += uint64(n)
+		select {
+		case raw, ok := <-rawChan:
+			if !ok {
+				return
+			}
+			c.stats.bytesIn += uint64(len(raw))
 			c.stats.pktsIn++
-			c.handleIncoming(tutk.ReverseTransCodePartial(nil, buf[:n]))
-		} else if err != nil {
-			c.stats.recvTimeouts++
+			c.handleIncoming(tutk.ReverseTransCodePartial(nil, raw))
+		case <-tick.C:
+			// fall through to periodic work below
 		}
+
 		if time.Since(lastForce) > 500*time.Millisecond {
 			c.forceDrain()
 			lastForce = time.Now()
@@ -444,6 +468,44 @@ func (c *Client) recvLoop() {
 		if c.verbose && time.Since(lastStats) > 5*time.Second {
 			c.dumpStats()
 			lastStats = time.Now()
+		}
+	}
+}
+
+// readerGoroutine does nothing but pull bytes off the wire as fast as
+// the kernel will deliver them and hand them to the processor.  Each
+// iteration allocates a fresh buffer because the channel may queue
+// many at once.
+func (c *Client) readerGoroutine(out chan<- []byte) {
+	defer close(out)
+	for {
+		c.closeMu.Lock()
+		done := c.closed
+		c.closeMu.Unlock()
+		if done {
+			return
+		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		buf := make([]byte, 65535)
+		n, _, err := c.conn.ReadFromUDP(buf)
+		if err != nil {
+			if isTimeout(err) {
+				c.stats.recvTimeouts++
+				continue
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		select {
+		case out <- buf[:n]:
+		default:
+			// Processor is behind by 1024 packets.  Drop the new
+			// one rather than block the reader and let the kernel
+			// drop instead — the inner cmd counter / frag_idx gap
+			// detection will mark the resulting AU as incomplete.
+			c.stats.recvTimeouts++
 		}
 	}
 }
