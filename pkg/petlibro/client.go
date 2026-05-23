@@ -883,7 +883,9 @@ func (c *Client) emit(e *pendingFrag) {
 		c.stats.fragSkips++
 		c.stats.fragsLost++
 		c.stats.vidDropped++
-		c.gopPoisoned = true
+		if c.strict {
+			c.gopPoisoned = true
+		}
 		asm.reset()
 	}
 	if e.frameNum != asm.curFrameNum {
@@ -942,7 +944,14 @@ func (c *Client) emit(e *pendingFrag) {
 	asm.curFrameNum = 0
 
 	if gapped {
-		c.gopPoisoned = true
+		// Strict mode: drop the entire GOP.  Non-strict: just drop
+		// the corrupted frame and let the next P-frames flow — the
+		// decoder will conceal motion vectors against the previous
+		// good IDR until the next clean IDR.  This trades pristine
+		// pixels for fluent playback when the wire is lossy.
+		if c.strict {
+			c.gopPoisoned = true
+		}
 		c.stats.vidDropped++
 		return
 	}
@@ -951,10 +960,9 @@ func (c *Client) emit(e *pendingFrag) {
 	if !wasMain {
 		c.lastPFrameTs = frameTs
 	}
-	// Drop P-frames in a poisoned GOP until the next clean IDR.
-	// Decoder has no valid reference frame for them.  emitAU resets
-	// gopPoisoned when it sees an IDR.
-	if c.gopPoisoned && !wasMain {
+	// In strict mode only, drop P-frames in a poisoned GOP until the
+	// next clean IDR.  In non-strict (default), let them through.
+	if c.strict && c.gopPoisoned && !wasMain {
 		c.stats.vidDropped++
 		return
 	}
@@ -986,7 +994,9 @@ func (c *Client) flushMainIDR(_ uint32) {
 		c.stats.fragsLost++
 	}
 	c.stats.vidDropped++
-	c.gopPoisoned = true
+	if c.strict {
+		c.gopPoisoned = true
+	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
 }
@@ -1003,9 +1013,9 @@ func (c *Client) emitAU(au []byte) {
 	if isKey {
 		// A fresh IDR clears the GOP-poisoned state.
 		c.gopPoisoned = false
-	} else if c.gopPoisoned {
-		// P-frame referencing a dropped IDR — decoder has no valid
-		// reference, would render garbage.  Drop until next IDR.
+	} else if c.strict && c.gopPoisoned {
+		// Strict only: drop P-frames referencing a dropped IDR.
+		// Non-strict lets the decoder conceal.
 		c.stats.vidDropped++
 		return
 	}
