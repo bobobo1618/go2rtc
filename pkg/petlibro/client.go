@@ -838,13 +838,23 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.stats.vidFrags++
 
-	// EXPERIMENTAL: this firmware sends BOTH ~16-fragment SD IDRs
-	// and ~75-fragment HD IDRs interleaved on ch=0x05.  The two
-	// resolutions confuse downstream decoders.  Drop the small SD
-	// IDR's data fragments so probe / decoder lock onto the HD SPS.
-	// ch=0x07 P-frames (f20=1) are always kept.
-	if e.channel == innerChMain && e.totalFrags > 0 && e.totalFrags < 30 {
-		return
+	// This firmware sends BOTH ~16-fragment SD IDRs (640x368 baseline
+	// level 3.0) AND ~75-fragment HD IDRs (1920x1088 baseline level
+	// 4.1) interleaved on ch=0x05.  The two resolutions confuse the
+	// downstream decoder (it locks onto whichever SPS arrives first
+	// and renders the other resolution with corrupt artifacts).
+	// Filter on inner[20] (total fragments) to keep only the size
+	// matching the configured quality.  ch=0x07 P-frames (f20=1) are
+	// always kept; they encode at whichever resolution is active.
+	//
+	// Threshold of 30 fragments is empirically half-way between the
+	// observed SD size (12-16 frags) and HD size (70-78 frags).
+	if e.channel == innerChMain && e.totalFrags > 0 {
+		isBigIDR := e.totalFrags >= 30
+		wantBig := c.quality != "sd" // default = "hd"
+		if isBigIDR != wantBig {
+			return
+		}
 	}
 
 	// This firmware variant:
