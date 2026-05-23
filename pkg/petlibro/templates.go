@@ -50,6 +50,10 @@ const (
 var (
 	qualityHD = []byte{0x24, 0, 0, 0, 0x01, 0x00, 0xff, 0x3f, 0, 0, 0, 0}
 	qualitySD = []byte{0x24, 0, 0, 0, 0x02, 0x00, 0x8a, 0x81, 0, 0, 0, 0}
+	// Experimental: SETSTREAMCTRL chan=2 type=0 — probe to see whether
+	// the camera will treat this as "disable sub stream".  Not documented;
+	// applied opportunistically when ?disable_sub=1 is set in the URL.
+	disableSubProbe = []byte{0x24, 0, 0, 0, 0x02, 0x00, 0x00, 0x00, 0, 0, 0, 0}
 )
 
 // Inner-cmd "channel" markers at offset 16..17.

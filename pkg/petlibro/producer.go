@@ -32,11 +32,12 @@ func NewProducer(rawURL string) (*Producer, error) {
 	q := u.Query()
 
 	opts := DialOptions{
-		UID:     q.Get("uid"),
-		Host:    u.Host,
-		Audio:   q.Get("audio") == "true" || q.Get("audio") == "1",
-		Quality: q.Get("quality"),
-		Verbose: q.Get("verbose") == "true" || q.Get("verbose") == "1",
+		UID:        q.Get("uid"),
+		Host:       u.Host,
+		Audio:      q.Get("audio") == "true" || q.Get("audio") == "1",
+		Quality:    q.Get("quality"),
+		DisableSub: q.Get("disable_sub") == "true" || q.Get("disable_sub") == "1",
+		Verbose:    q.Get("verbose") == "true" || q.Get("verbose") == "1",
 	}
 	if opts.UID == "" {
 		return nil, fmt.Errorf("petlibro: uid query parameter required")

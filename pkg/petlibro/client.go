@@ -44,12 +44,13 @@ type Packet struct {
 
 // DialOptions configure a Petlibro session.
 type DialOptions struct {
-	UID      string
-	Host     string // "ip" or "ip:32761"
-	Password string // default "888888" — encoded into the LOGIN template
-	Audio    bool
-	Quality  string // "hd" (default) or "sd"
-	Verbose  bool
+	UID        string
+	Host       string // "ip" or "ip:32761"
+	Password   string // default "888888" — encoded into the LOGIN template
+	Audio      bool
+	Quality    string // "hd" (default) or "sd"
+	DisableSub bool   // experimental: try to make the camera stop dual-streaming
+	Verbose    bool
 }
 
 // Client is one LAN session against a Petlibro camera.
@@ -86,6 +87,7 @@ type Client struct {
 
 	audio           bool
 	quality         string
+	disableSub      bool
 	verbose         bool
 	videoChannel    byte   // inner-channel byte of the video stream we consume
 	curFrameNum     uint32 // camera frame counter of the AU currently being assembled
@@ -103,6 +105,10 @@ type Client struct {
 type counters struct {
 	bytesIn      uint64 // bytes read from the UDP socket (encrypted)
 	pktsIn       uint64 // UDP datagrams successfully read
+	mainFrags    uint64 // fragments on channel 0x05 (HD)
+	subFrags     uint64 // fragments on channel 0x07 (SD video)
+	audioFrags   uint64 // fragments on channel 0x03
+	otherFrags   uint64 // anything else (control, etc.)
 	vidFrags     uint64 // video fragments (matching videoChannel) reaching emit
 	vidFramesIn  uint64 // distinct frame_num values seen on video channel
 	vidFramesOut uint64 // AUs successfully queued to consumers
@@ -183,6 +189,7 @@ func Dial(opts DialOptions) (*Client, error) {
 		kseq:         2,
 		audio:        opts.Audio,
 		quality:      opts.Quality,
+		disableSub:   opts.DisableSub,
 		verbose:      opts.Verbose,
 		videoChannel: videoChan,
 		frames:       make(chan *Packet, 256),
@@ -339,8 +346,15 @@ func (c *Client) bootstrap() error {
 		{0x7000, ioctlBody12(IOCtrlVendor0372)},
 		{0x7000, ioctlBody12(IOCtrlVendor0322)},
 		{0x7000, ioctlBody12(IOCtrlVendor032A)},
-		{0x1000, stream},
 	}
+	if c.disableSub {
+		// Experimental: try to ask the camera to stop dual-streaming.
+		// Send the "disable" SETSTREAMCTRL for chan=2 before the
+		// activate command for chan=1.  Both are sent on the same
+		// control channel as the regular quality command.
+		cmds = append(cmds, cmd{0x1000, disableSubProbe})
+	}
+	cmds = append(cmds, cmd{0x1000, stream})
 	if c.audio {
 		audioOn := ioctlBody12(IOCtrlAudioOn)
 		audioOn[4] = 0x01 // enable flag
@@ -515,12 +529,15 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 // interval; the cumulative counters are also visible.
 func (c *Client) dumpStats() {
 	s := &c.stats
-	delta := s
+	delta := *s
 	if c.prevStats.bytesIn > 0 {
-		// compute deltas
-		delta = &counters{
+		delta = counters{
 			bytesIn:      s.bytesIn - c.prevStats.bytesIn,
 			pktsIn:       s.pktsIn - c.prevStats.pktsIn,
+			mainFrags:    s.mainFrags - c.prevStats.mainFrags,
+			subFrags:     s.subFrags - c.prevStats.subFrags,
+			audioFrags:   s.audioFrags - c.prevStats.audioFrags,
+			otherFrags:   s.otherFrags - c.prevStats.otherFrags,
 			vidFrags:     s.vidFrags - c.prevStats.vidFrags,
 			vidFramesIn:  s.vidFramesIn - c.prevStats.vidFramesIn,
 			vidFramesOut: s.vidFramesOut - c.prevStats.vidFramesOut,
@@ -531,9 +548,10 @@ func (c *Client) dumpStats() {
 			recvTimeouts: s.recvTimeouts - c.prevStats.recvTimeouts,
 		}
 	}
-	fmt.Printf("[petlibro/stats] in=%d pkts (%d KiB) | video: %d frags %d frames in -> %d out (drop %d) | frag skips: %d (%d frags lost) | forceDrain: %d\n",
+	fmt.Printf("[petlibro/stats] in=%d pkts (%d KiB) channels: main=%d sub=%d audio=%d other=%d | video: %d frames in -> %d out (drop %d) | frag skips: %d (%d frags lost) | forceDrain: %d\n",
 		delta.pktsIn, delta.bytesIn/1024,
-		delta.vidFrags, delta.vidFramesIn, delta.vidFramesOut, delta.vidDropped,
+		delta.mainFrags, delta.subFrags, delta.audioFrags, delta.otherFrags,
+		delta.vidFramesIn, delta.vidFramesOut, delta.vidDropped,
 		delta.fragSkips, delta.fragsLost, delta.forceDrains)
 	c.prevStats = *s
 }
@@ -599,6 +617,16 @@ func (c *Client) handleIncoming(pkt []byte) {
 	channel := inner[16] // low byte of bytes16..17
 	sub17 := inner[17]
 	subWire := binary.LittleEndian.Uint16(inner[18:])
+	switch channel {
+	case innerChMain:
+		c.stats.mainFrags++
+	case innerChSub:
+		c.stats.subFrags++
+	case innerChAudio:
+		c.stats.audioFrags++
+	default:
+		c.stats.otherFrags++
+	}
 	// paylen at bytes 24..25 covers the actual payload bytes after offset
 	// 36; the camera often pads packets with trailing zeros, and feeding
 	// those into the stream synthesises spurious H.264 start codes that
