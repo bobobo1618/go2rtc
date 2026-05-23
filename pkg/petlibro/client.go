@@ -980,40 +980,41 @@ func (c *Client) emitAU(au []byte) {
 }
 
 
-// stripFragmentMetadataTrailer removes the 15-byte per-frame metadata
-// trailer the Petlibro firmware appends to the LAST video fragment of
-// each frame.  There are two variants of the structural prefix:
+// stripFragmentMetadataTrailer removes the 16-byte per-frame metadata
+// block the Petlibro firmware appends to the LAST video fragment of
+// each frame.  The block is `<codec_id 1B> <variant prefix 4B>
+// <7B zeros> <4B LE ms ts>`:
 //
-//	P-frame:  00 00 00 01  00 00 00 00 00 00 00  <4-byte LE ms ts>
-//	IDR/key:  00 01 00 01  00 00 00 00 00 00 00  <4-byte LE ms ts>
+//	P-frame:  4e  00 00 00 01  00 00 00 00 00 00 00  <ts>
+//	IDR/key:  4e  00 01 00 01  00 00 00 00 00 00 00  <ts>
 //
-// Both variants use 11 fixed bytes + a 4-byte millisecond counter.
-// Missing the keyframe variant (byte 1 = 0x01 instead of 0x00) was the
-// root cause of persistent bottom-MB-row decoder errors — the trailer
-// leaked into the IDR slice's tail and the decoder parsed garbage at
-// the very end of the slice.
+// codec_id is 0x4e (= CodecH264) for video.  Verified 0x4e in 725/725
+// end fragments of PCAPdroid_22_May_08_31_19.pcap.  Five of those
+// fragments had paylen == 16, meaning the whole payload IS the
+// metadata block (zero slice bytes — the entire frame's slice data
+// was in earlier fragments).
 //
-// Callers should only invoke this on fragments where fragIdx == 16
-// (the explicit last-fragment marker).  At the frame tail the
-// signature is unambiguous; in mid-frame fragments a coincidental
-// match could shear real slice bytes.
+// Stripping only the 15 trailer bytes leaves the 0x4e in the slice
+// tail.  Decoders read it as the start of a NAL-14 (SVC prefix unit)
+// without a preceding start code and bail on the NEXT frame with
+// "mb_skip_run invalid at MB 0,0".  Strip all 16 bytes.
 //
-// When a trailer is found, ts is the 4-byte LE millisecond counter
-// from the camera's frame clock — used downstream as the H.264 PTS.
+// Callers should only invoke this on the frame's end fragment (whose
+// tail unambiguously matches the signature) — in mid-frame fragments
+// a coincidental match could shear real slice bytes.
 func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs bool) {
-	if len(p) < 15 {
+	if len(p) < 16 {
 		return p, 0, false
 	}
-	t := p[len(p)-15:]
-	// Variant detector: byte[0..3] is either 00 00 00 01 (P-frame) or
-	// 00 01 00 01 (keyframe); byte[4..10] is always 7 zeros.
+	t := p[len(p)-15:] // 15-byte trailer right after the codec_id byte
 	prefixOK := (t[0] == 0x00 && t[1] == 0x00 && t[2] == 0x00 && t[3] == 0x01) ||
 		(t[0] == 0x00 && t[1] == 0x01 && t[2] == 0x00 && t[3] == 0x01)
 	zerosOK := t[4] == 0 && t[5] == 0 && t[6] == 0 && t[7] == 0 &&
 		t[8] == 0 && t[9] == 0 && t[10] == 0
-	if prefixOK && zerosOK {
+	codecIDOK := p[len(p)-16] == CodecH264
+	if prefixOK && zerosOK && codecIDOK {
 		ts = binary.LittleEndian.Uint32(t[11:15])
-		return p[:len(p)-15], ts, true
+		return p[:len(p)-16], ts, true
 	}
 	return p, 0, false
 }
