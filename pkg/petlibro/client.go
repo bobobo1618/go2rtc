@@ -94,6 +94,7 @@ type Client struct {
 	curAUIncomplete  bool   // true if a frag_idx gap occurred during the current AU
 	curAUWasKeyframe bool   // current AU begins with SPS (drop on loss to avoid GOP poison)
 	expectFragIdx    uint16 // next frag_idx we expect within the current frame
+	bufHigh          int    // diag: largest curBuf seen since last emit
 
 	stats     counters
 	prevStats counters
@@ -762,13 +763,14 @@ func (c *Client) emit(e *pendingFrag) {
 		c.emitAudioSeq++
 		return
 	}
-	// Cameras commonly dual-stream: main (0x05) carries a high-quality
-	// elementary stream and sub (0x07) carries a low-quality one, each
-	// with its own SPS/PPS/IDR/P-slices and its own frame counter.
-	// Concatenating both produces garbled H.264 because the streams
-	// are independent.  Consume only the channel matching the
-	// requested quality.
-	if e.channel != c.videoChannel {
+	// The camera transports ONE H.264 elementary stream over two inner
+	// channels: 0x05 carries the keyframe NALs (SPS+PPS+SEI+IDR) and
+	// 0x07 carries the P-slice NALs.  Both are interleaved by sub_idx
+	// and must be reassembled together; filtering to just one channel
+	// gives you a string of keyframes or a string of orphaned P-frames
+	// (the AU detector then sees no new start code, curBuf grows, and
+	// playback degrades to ~1 fps).
+	if e.channel != innerChMain && e.channel != innerChSub {
 		return
 	}
 	c.stats.vidFrags++
@@ -832,8 +834,19 @@ func (c *Client) tryEmitAU() {
 		}
 		next := findAUStart(c.curBuf, skip)
 		if next < 0 {
+			// Debug: how big has curBuf grown without finding a 2nd AU?
+			if c.verbose && len(c.curBuf) > 0 && len(c.curBuf) > c.bufHigh+4096 {
+				c.bufHigh = len(c.curBuf)
+				head := c.curBuf
+				if len(head) > 48 {
+					head = head[:48]
+				}
+				fmt.Printf("[petlibro] curBuf grew to %d, no 2nd AU; head=%x\n",
+					len(c.curBuf), head)
+			}
 			return
 		}
+		c.bufHigh = 0
 		au := append([]byte(nil), c.curBuf[:next]...)
 		c.curBuf = c.curBuf[next:]
 		c.emitAU(au)
@@ -874,8 +887,15 @@ func (c *Client) emitAU(au []byte) {
 		return
 	}
 	isKey := containsNALType(au, 5)
-	const ticksPerFrame = 90000 / 25
-	pts := c.emitSeq * ticksPerFrame
+	if c.startedAt.IsZero() {
+		c.startedAt = time.Now()
+	}
+	// PTS in the H.264 90 kHz clock, anchored to wall-clock since the
+	// first emitted AU.  If we used `emitSeq * 3600` instead, frames
+	// would be labelled at the declared 25 fps but arrive at our real
+	// emit rate (often much slower under loss), so the RTSP consumer
+	// would buffer them as "future" frames and starve the player.
+	pts := uint32(time.Since(c.startedAt).Milliseconds() * 90)
 	c.queuePacket(&Packet{
 		Codec:      CodecH264,
 		Payload:    au,
