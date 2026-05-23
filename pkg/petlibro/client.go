@@ -864,14 +864,40 @@ func (c *Client) emit(e *pendingFrag) {
 			return
 		}
 	}
-	// Note: we deliberately do NOT filter ch=0x07 P-frames by trailer
-	// stream-id.  The camera in SD mode appears to still send many
-	// HD-encoded P-frames on ch=0x07 (with trailer stream_id=0x01).
-	// Dropping them leaves so few SD P-frames that mpv can't decode
-	// any GOP — the SD IDR has no following P-frames at all.
-	// Instead we accept all ch=0x07 fragments and let the SD decoder
-	// cope with the occasional HD-sized P-slice it can't decode.
-	_ = wantStreamID
+	// ch=0x07 P-frame: filter by trailer stream-id byte.  The camera
+	// dual-streams regardless of SETSTREAMCTRL — feeding HD-encoded
+	// P-frames into an SD decoder produces top-row mb_type / cbp
+	// errors and is semantically wrong (the consumer asked for a
+	// 360p stream).  Accept only the matching stream.
+	//
+	// Trailer byte layout for ch=0x07 P-frames (single fragment):
+	//   p[-16] = 0x4e codec_id
+	//   p[-15] = 0x00
+	//   p[-14] = 0x00 (P-frame; 0x01 for IDR — not seen on ch=0x07)
+	//   p[-13] = 0x00
+	//   p[-12] = stream-id (0x01 HD / 0x02 SD)
+	//
+	// Note: SD P-frames are rare on this firmware (~10% of ch=0x07
+	// traffic), so SD playback is closer to a slideshow than 25 fps
+	// video.  That's a camera-side encoding choice — the camera only
+	// emits an SD P-frame when there's actual motion to encode.
+	if e.channel == innerChSub && len(e.payload) >= 16 &&
+		e.payload[len(e.payload)-16] == CodecH264 &&
+		e.payload[len(e.payload)-12] != wantStreamID {
+		// Filtering this fragment, but still flush any pending IDR
+		// — a ch=0x07 arrival (of any stream) signals that the
+		// preceding ch=0x05 IDR is complete on the wire.  Without
+		// this the SD IDR never emits because all ch=0x07 P-frames
+		// are filtered.
+		if len(c.mainAsm.buf) > 0 {
+			// Use trailer ts from this P-frame (even though we're
+			// dropping it) as a reference for the IDR's PTS.
+			t := e.payload[len(e.payload)-4:]
+			frameTs := binary.LittleEndian.Uint32(t)
+			c.flushMainIDR(frameTs)
+		}
+		return
+	}
 
 	// This firmware variant:
 	//   ch=0x05 IDR fragments arrive WITHOUT a trailer-bearing end
@@ -900,19 +926,26 @@ func (c *Client) emit(e *pendingFrag) {
 		asm = &c.subAsm
 	}
 
-	// Frame_num change on THIS channel without a clean end fragment
-	// means the end was lost.  For ch=0x05 this is a back-to-back IDR
-	// sequence (the previous IDR's end-fragment was lost AND no
-	// ch=0x07 P-frame came in between to trigger flushMainIDR).
-	// Either way the previous frame is corrupt — drop and poison.
+	// Frame_num change on THIS channel without a clean end fragment.
+	// For ch=0x05 this is back-to-back IDRs (the previous IDR's
+	// end-fragment was lost AND no ch=0x07 P-frame came in between).
+	// Treat it the same as a cross-channel flush — try to emit the
+	// previous IDR rather than silently drop it.  This matters most
+	// when filtering ch=0x07 (e.g. quality=sd where every HD P-frame
+	// is filtered out), since cross-channel flush would otherwise
+	// never fire.
 	if asm.curFrameNum != 0 && e.frameNum != asm.curFrameNum && len(asm.buf) > 0 {
-		c.stats.fragSkips++
-		c.stats.fragsLost++
-		c.stats.vidDropped++
-		if c.strict {
-			c.gopPoisoned = true
+		if e.channel == innerChMain {
+			c.flushMainIDR(0)
+		} else {
+			c.stats.fragSkips++
+			c.stats.fragsLost++
+			c.stats.vidDropped++
+			if c.strict {
+				c.gopPoisoned = true
+			}
+			asm.reset()
 		}
-		asm.reset()
 	}
 	if e.frameNum != asm.curFrameNum {
 		asm.curFrameNum = e.frameNum
@@ -1024,11 +1057,12 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
-	if midGapped || c.strict {
+	if c.strict {
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
 	}
+	_ = midGapped
 	_ = tailMissing
 	if nextPFrameTs != 0 {
 		idrTs := nextPFrameTs - 40
