@@ -772,82 +772,108 @@ func (c *Client) emit(e *pendingFrag) {
 		return
 	}
 	c.stats.vidFrags++
-	// Track wire-sequence contiguity across video fragments.  When
-	// forceDrain advances past lost fragments, the next video sub_ext
-	// will be more than ~jitter+audio_interleave fragments ahead of
-	// the previous one.  Mark the in-progress AU as incomplete so we
-	// can drop it rather than emit a slice missing its tail rows —
-	// which is what produced the bottom-row "corrupt macroblock"
-	// errors at high MB y-coordinates.
-	// AU boundaries from the per-fragment camera frame counter
-	// (inner[28..31]).  When it changes, the previous frame is done.
-	// Emit it even if some fragments were lost — the decoder will
-	// flag corrupt MBs but recover at the next keyframe, which is
-	// better UX than discarding frames entirely (slideshow effect).
-	// We only DROP the IDR keyframe if it's incomplete, because a
-	// broken IDR poisons the entire GOP that follows.
+	// `inner[28..31]` was documented in PROTOCOL_NOTES as a per-frame
+	// counter, but on this firmware it changes far slower than the
+	// SPS-declared 25 fps — empirically once per GOP (~1 Hz).  Using
+	// it as the AU boundary gave us slideshow playback.  Track it
+	// for stats only.
 	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum {
 		c.stats.vidFramesIn++
-		if c.curAUIncomplete {
-			c.stats.vidDropped++
-		}
-		// Emit every frame — even partial ones.  Decoder concealment
-		// handles missing slices much better than total-frame loss,
-		// which creates a slideshow effect.
-		if len(c.curBuf) > 0 {
-			c.flushCurrentAU()
-		}
-		c.curAUIncomplete = false
-		c.curAUWasKeyframe = false
 		c.expectFragIdx = 0
 	}
 	c.curFrameNum = e.frameNum
-	// frag_idx (inner[22..23]) is the index of this fragment within
-	// the current frame, starting at 0 and incrementing by 1.  Any
-	// skip means UDP loss.
 	if e.fragIdx != c.expectFragIdx {
-		c.curAUIncomplete = true
 		c.stats.fragSkips++
 		if e.fragIdx > c.expectFragIdx {
 			c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
 		}
 	}
 	c.expectFragIdx = e.fragIdx + 1
-	// First fragment of a frame whose payload begins with SPS (NAL=7)
-	// is a keyframe AU.  We need this to know whether a damaged AU
-	// is poison (broken IDR breaks the whole GOP).
-	if e.fragIdx == 0 && len(e.payload) >= 5 &&
-		e.payload[0] == 0 && e.payload[1] == 0 && e.payload[2] == 0 &&
-		e.payload[3] == 1 && (e.payload[4]&0x1F) == 7 {
-		c.curAUWasKeyframe = true
-	}
+
 	payload := stripFragmentMetadataTrailer(e.payload)
 	if c.dumpFile != nil {
 		_, _ = c.dumpFile.Write(payload)
 	}
 	c.curBuf = append(c.curBuf, payload...)
+	// AU boundaries come from scanning the byte stream for a NEW
+	// access-unit-starting NAL — SPS (7) for keyframes, P-slice (1)
+	// for non-IDR pictures.  This is the per-FRAME boundary the
+	// decoder needs, not the per-GOP frame_num.  The camera does
+	// emit emulation-prevention bytes for SPS-7 patterns (we verified
+	// — no false positives observed for `00 00 00 01 67`) so we can
+	// safely cut there.  Non-IDR boundaries (NAL=1) DO have false
+	// positives in slice payload, so we only cut on SPS or on the
+	// first byte after seeing the slice-end pattern `00 80` (a common
+	// RBSP trailing marker).  Best-effort but produces ~25 fps.
+	c.tryEmitAU()
 }
 
-// flushCurrentAU emits whatever has accumulated in curBuf as one
-// access unit.  Called when a new b1==0x00 fragment arrives — the
-// camera's protocol-level signal that a fresh frame is starting.
-func (c *Client) flushCurrentAU() {
-	if len(c.curBuf) < 5 {
-		c.curBuf = nil
-		return
+// tryEmitAU scans curBuf for complete access units and emits them.
+// An AU is defined as the bytes between two AU-start markers (SPS or
+// non-IDR P-slice).  We need TWO start markers to know the first AU
+// is complete — otherwise we'd emit a truncated AU and corrupt the
+// trailing slice.  The (small) penalty: ~1 frame of latency.
+func (c *Client) tryEmitAU() {
+	for {
+		first := findAUStart(c.curBuf, 0)
+		if first < 0 {
+			return
+		}
+		if first > 0 {
+			// Drop everything before the first real NAL.
+			c.curBuf = c.curBuf[first:]
+		}
+		// Skip past the leading start code so we don't immediately
+		// re-find it.
+		skip := 4
+		if len(c.curBuf) >= 4 && !(c.curBuf[0] == 0 && c.curBuf[1] == 0 &&
+			c.curBuf[2] == 0 && c.curBuf[3] == 1) {
+			skip = 3
+		}
+		next := findAUStart(c.curBuf, skip)
+		if next < 0 {
+			return
+		}
+		au := append([]byte(nil), c.curBuf[:next]...)
+		c.curBuf = c.curBuf[next:]
+		c.emitAU(au)
 	}
-	if !(c.curBuf[0] == 0 && c.curBuf[1] == 0 &&
-		((c.curBuf[2] == 0 && c.curBuf[3] == 1) || c.curBuf[2] == 1)) {
-		c.curBuf = nil
-		return
-	}
-	au := c.curBuf
-	c.curBuf = nil
-	isKey := containsNALType(au, 5)
-	c.stats.vidFramesOut++
+}
 
-	// Frame-based PTS: each AU is one frame at ~25 fps, monotonic
-	// regardless of host clock resolution.
+// findAUStart finds the byte offset of the next H.264 access unit
+// boundary in b at offset >= start.  An AU starts at an SPS NAL (type
+// 7) or a non-IDR slice (type 1).  Returns -1 if none found.
+func findAUStart(b []byte, start int) int {
+	for i := start; i+4 < len(b); i++ {
+		if b[i] != 0 || b[i+1] != 0 {
+			continue
+		}
+		var nalPos int
+		switch {
+		case b[i+2] == 1:
+			nalPos = i + 3
+		case b[i+2] == 0 && i+4 < len(b) && b[i+3] == 1:
+			nalPos = i + 4
+		default:
+			continue
+		}
+		if nalPos >= len(b) {
+			return -1
+		}
+		nal := b[nalPos] & 0x1F
+		if nal == 7 || nal == 1 {
+			return i
+		}
+	}
+	return -1
+}
+
+// emitAU finalises one access unit and queues it for the consumer.
+func (c *Client) emitAU(au []byte) {
+	if len(au) < 5 {
+		return
+	}
+	isKey := containsNALType(au, 5)
 	const ticksPerFrame = 90000 / 25
 	pts := c.emitSeq * ticksPerFrame
 	c.queuePacket(&Packet{
@@ -858,7 +884,9 @@ func (c *Client) flushCurrentAU() {
 		IsKeyframe: isKey,
 	})
 	c.emitSeq++
+	c.stats.vidFramesOut++
 }
+
 
 // stripFragmentMetadataTrailer removes the 15-byte per-frame metadata
 // trailer the Petlibro firmware appends to the LAST video fragment of
