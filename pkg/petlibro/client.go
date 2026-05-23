@@ -120,7 +120,8 @@ type Client struct {
 	stats     counters
 	prevStats counters
 
-	dumpFile *os.File // optional raw-stream dump for debugging
+	dumpFile     *os.File // optional raw-stream dump for debugging
+	emitDumpFile *os.File // optional emitted-AU dump for debugging
 }
 
 // counters holds running totals for a stream-health summary.
@@ -216,6 +217,11 @@ func Dial(opts DialOptions) (*Client, error) {
 	if path := os.Getenv("PETLIBRO_DUMP_VIDEO"); path != "" {
 		if f, ferr := os.Create(path); ferr == nil {
 			c.dumpFile = f
+		}
+	}
+	if path := os.Getenv("PETLIBRO_DUMP_EMITTED"); path != "" {
+		if f, ferr := os.Create(path); ferr == nil {
+			c.emitDumpFile = f
 		}
 	}
 
@@ -350,7 +356,21 @@ func (c *Client) bootstrap() error {
 	}
 	c.icounter++
 
-	// 2. The 7 IOCtrl bootstrap commands.
+	// 2. IOCtrl bootstrap commands — match the official Petlibro app's
+	// sequence (verified against PCAPdroid_22_May_08_31_19.pcap):
+	//
+	//	1. SETSTREAMCTRL HD     (chan=0x1000, chan=1 type=0x3fff)
+	//	2. Vendor 0x0372        (chan=0x7000)
+	//	3. GET_AUDIO_OUT_FORMAT (chan=0x7000, IOCtrl 0x0322)
+	//	4. GET_FORMAT           (chan=0x7000, IOCtrl 0x032A)
+	//	5. IPCAM_START          (chan=0x7000, body[4]=0)
+	//	6. (optional) AUDIO_ENABLE if audio=true
+	//
+	// Previous bootstrap had two extra 0x0000 channel-init commands
+	// and sent SETSTREAMCTRL after the vendor cmds rather than first.
+	// On a real HD-capable camera this resulted in the camera dual-
+	// streaming HD + SD with the SD IDR sometimes winning probe and
+	// breaking decoding.
 	stream := qualityHD
 	if c.quality == "sd" {
 		stream = qualitySD
@@ -360,29 +380,23 @@ func (c *Client) bootstrap() error {
 		payload []byte
 	}
 	cmds := []cmd{
-		{0x7000, []byte{0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0xb0}},
-		{0x7000, []byte{0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x28}},
+		{0x1000, stream},
 		{0x7000, ioctlBody12(IOCtrlVendor0372)},
 		{0x7000, ioctlBody12(IOCtrlVendor0322)},
 		{0x7000, ioctlBody12(IOCtrlVendor032A)},
+		{0x7000, ioctlBody12(IOCtrlStart)},
 	}
 	if c.disableSub {
-		// Experimental: try to ask the camera to stop dual-streaming.
-		// Send the "disable" SETSTREAMCTRL for chan=2 before the
-		// activate command for chan=1.  Both are sent on the same
-		// control channel as the regular quality command.
-		cmds = append(cmds, cmd{0x1000, disableSubProbe})
+		// Experimental: try to ask the camera to stop dual-streaming
+		// by sending a separate sub-channel SETSTREAMCTRL.
+		cmds = append([]cmd{{0x1000, disableSubProbe}}, cmds...)
 	}
-	cmds = append(cmds, cmd{0x1000, stream})
 	if c.audio {
+		// The app enables audio AFTER IPCAM_START via a separate
+		// 0x0300 AUDIO_ENABLE; do not also pack it into IPCAM_START.
 		audioOn := ioctlBody12(IOCtrlAudioOn)
-		audioOn[4] = 0x01 // enable flag
+		audioOn[4] = 0x01
 		cmds = append(cmds, cmd{0x7000, audioOn})
-		startBody := ioctlBody12(IOCtrlStart)
-		startBody[4] = 0x01
-		cmds = append(cmds, cmd{0x7000, startBody})
-	} else {
-		cmds = append(cmds, cmd{0x7000, ioctlBody12(IOCtrlStart)})
 	}
 
 	var bootstrapAVMax uint16 = 0x3FFF
@@ -927,6 +941,9 @@ func (c *Client) emitAU(au []byte) {
 		return
 	}
 	isKey := containsNALType(au, 5)
+	if c.emitDumpFile != nil {
+		_, _ = c.emitDumpFile.Write(au)
+	}
 	if c.strict {
 		if isKey {
 			// IDR is a fresh start — the GOP is no longer poisoned.

@@ -70,6 +70,11 @@ func NewProducer(rawURL string) (*Producer, error) {
 }
 
 func (p *Producer) Start() error {
+	// probe() ate the first IDR for its SPS; forwarding P-frames
+	// before another IDR arrives makes the downstream decoder
+	// reference a frame it never saw.  Hold H.264 until the first
+	// IsKeyframe=true packet, then start forwarding.
+	keyframeSeen := false
 	for {
 		_ = p.client.SetDeadline(time.Now().Add(core.ConnDeadline))
 		pkt, err := p.client.ReadPacket()
@@ -85,6 +90,12 @@ func (p *Producer) Start() error {
 
 		switch pkt.Codec {
 		case CodecH264:
+			if !keyframeSeen {
+				if !pkt.IsKeyframe {
+					continue
+				}
+				keyframeSeen = true
+			}
 			name = core.CodecH264
 			avcc := annexb.EncodeToAVCC(pkt.Payload)
 			if len(avcc) < 5 {
