@@ -96,6 +96,16 @@ type Client struct {
 	expectFragIdx    uint16 // next frag_idx we expect within the current frame
 	bufHigh          int    // diag: largest curBuf seen since last emit
 
+	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
+	// extracted from the most recently seen metadata trailer; it
+	// becomes the PTS for the next emitted AU.  firstFrameTs is the
+	// first ts we saw, used to anchor the 90kHz PTS at 0.
+	pendingFrameTs uint32
+	havePendingTs  bool
+	firstFrameTs   uint32
+	haveFirstTs    bool
+	lastEmitTs     uint32 // last PTS we emitted (in 90 kHz) — monotonic guard
+
 	stats     counters
 	prevStats counters
 
@@ -792,21 +802,21 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.expectFragIdx = e.fragIdx + 1
 
-	payload := stripFragmentMetadataTrailer(e.payload)
+	payload, frameTs, hasTs := stripFragmentMetadataTrailer(e.payload)
+	if hasTs {
+		// The trailer marks "end of frame N" — use its millisecond
+		// counter as PTS for the next AU we emit (which contains the
+		// bytes from the previous trailer up to now).
+		c.pendingFrameTs = frameTs
+		c.havePendingTs = true
+	}
 	if c.dumpFile != nil {
 		_, _ = c.dumpFile.Write(payload)
 	}
 	c.curBuf = append(c.curBuf, payload...)
 	// AU boundaries come from scanning the byte stream for a NEW
 	// access-unit-starting NAL — SPS (7) for keyframes, P-slice (1)
-	// for non-IDR pictures.  This is the per-FRAME boundary the
-	// decoder needs, not the per-GOP frame_num.  The camera does
-	// emit emulation-prevention bytes for SPS-7 patterns (we verified
-	// — no false positives observed for `00 00 00 01 67`) so we can
-	// safely cut there.  Non-IDR boundaries (NAL=1) DO have false
-	// positives in slice payload, so we only cut on SPS or on the
-	// first byte after seeing the slice-end pattern `00 80` (a common
-	// RBSP trailing marker).  Best-effort but produces ~25 fps.
+	// for non-IDR pictures.
 	c.tryEmitAU()
 }
 
@@ -887,15 +897,37 @@ func (c *Client) emitAU(au []byte) {
 		return
 	}
 	isKey := containsNALType(au, 5)
-	if c.startedAt.IsZero() {
-		c.startedAt = time.Now()
+
+	// PTS comes from the camera's own millisecond clock embedded in
+	// the metadata trailer of each frame's last fragment.  This gives
+	// per-frame-accurate timestamps that survive forceDrain bursts —
+	// wall-clock derived PTS produced "Invalid video timestamp X -> X"
+	// duplicates in mpv because multiple AUs flushed within one ms.
+	var pts uint32
+	if c.havePendingTs {
+		if !c.haveFirstTs {
+			c.firstFrameTs = c.pendingFrameTs
+			c.haveFirstTs = true
+		}
+		// Frame counter is u32 LE ms; subtract origin and convert to
+		// the H.264 90 kHz clock.  Wrap-safe via unsigned subtraction.
+		ms := c.pendingFrameTs - c.firstFrameTs
+		pts = ms * 90
+		c.havePendingTs = false
+	} else {
+		// No trailer seen yet (early packets before the first frame
+		// finishes) or the trailer for this AU was lost — fall back
+		// to "just-after the last emitted PTS" so playback ordering
+		// stays monotonic and the AU doesn't collide with the prior
+		// one.
+		pts = c.lastEmitTs + 1
 	}
-	// PTS in the H.264 90 kHz clock, anchored to wall-clock since the
-	// first emitted AU.  If we used `emitSeq * 3600` instead, frames
-	// would be labelled at the declared 25 fps but arrive at our real
-	// emit rate (often much slower under loss), so the RTSP consumer
-	// would buffer them as "future" frames and starve the player.
-	pts := uint32(time.Since(c.startedAt).Milliseconds() * 90)
+	if pts <= c.lastEmitTs && c.lastEmitTs != 0 {
+		// Strictly monotonic — never re-use a previous PTS.
+		pts = c.lastEmitTs + 1
+	}
+	c.lastEmitTs = pts
+
 	c.queuePacket(&Packet{
 		Codec:      CodecH264,
 		Payload:    au,
@@ -925,17 +957,22 @@ func (c *Client) emitAU(au []byte) {
 // bytes, so the same byte signature occasionally appears inside slice
 // payload as a coincidence; an AU-level scanner would mistakenly cut
 // real slice bytes.  At the fragment tail there is no such ambiguity.
-func stripFragmentMetadataTrailer(p []byte) []byte {
+//
+// When a trailer is found, ts is the 4-byte LE millisecond counter from
+// the camera's frame clock — used downstream as the H.264 PTS so we
+// don't have to invent timestamps from wall clock.
+func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs bool) {
 	if len(p) < 15 {
-		return p
+		return p, 0, false
 	}
 	t := p[len(p)-15:]
 	if t[0] == 0 && t[1] == 0 && t[2] == 0 && t[3] == 1 &&
 		t[4] == 0 && t[5] == 0 && t[6] == 0 && t[7] == 0 &&
 		t[8] == 0 && t[9] == 0 && t[10] == 0 {
-		return p[:len(p)-15]
+		ts = binary.LittleEndian.Uint32(t[11:15])
+		return p[:len(p)-15], ts, true
 	}
-	return p
+	return p, 0, false
 }
 
 // containsNALType reports whether the Annex-B buffer contains any NAL
