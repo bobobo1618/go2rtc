@@ -969,36 +969,36 @@ func (c *Client) emit(e *pendingFrag) {
 	c.emitAU(au)
 }
 
-// flushMainIDR handles a pending ch=0x05 IDR buffer when a ch=0x07
-// P-frame arrives WITHOUT us having processed the IDR's end-fragment.
-// That end-fragment (b1=0x05 fragIdx=16, K-variant trailer) carries
-// the FINAL ~300 bytes of the IDR slice (the bottom MB rows of the
-// HD frame).  Without it the slice is truncated and the decoder
-// throws "out of range intra chroma pred mode" / "corrupted
-// macroblock" / "Invalid level prefix" errors at MB rows 66-67.
-//
-// ALWAYS drop these IDRs (even in non-strict mode).  Emitting them
-// would propagate corruption to every following P-frame in the GOP
-// via inter-frame prediction.  Poison the GOP so subsequent P-frames
-// are also dropped until the next complete IDR resyncs us.
-func (c *Client) flushMainIDR(_ uint32) {
+// flushMainIDR emits the accumulated ch=0x05 IDR buffer when a
+// ch=0x07 P-frame arrives without us having seen the IDR's
+// end-fragment.  PTS = next P-frame's trailer minus one frame
+// interval (40 ms @ 25 fps).  In strict mode the partial IDR is
+// dropped instead (its slice is truncated and the decoder will
+// throw bottom-MB-row errors).
+func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	if len(c.mainAsm.buf) == 0 {
 		c.mainAsm.reset()
 		c.mainAsm.curFrameNum = 0
 		return
 	}
-	c.stats.fragSkips++
+	au := append([]byte(nil), c.mainAsm.buf...)
 	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount+1 < c.mainAsm.curAUTotal {
+		c.stats.fragSkips++
 		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount)
-	} else {
-		c.stats.fragsLost++
-	}
-	c.stats.vidDropped++
-	if c.strict {
-		c.gopPoisoned = true
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
+	if c.strict {
+		c.gopPoisoned = true
+		c.stats.vidDropped++
+		return
+	}
+	if nextPFrameTs != 0 {
+		idrTs := nextPFrameTs - 40
+		c.pendingFrameTs = idrTs
+		c.havePendingTs = true
+	}
+	c.emitAU(au)
 }
 
 // emitAU finalises one access unit and queues it for the consumer.
