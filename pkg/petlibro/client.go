@@ -99,6 +99,9 @@ type Client struct {
 	bufHigh          int    // diag: largest curBuf seen since last emit
 	gopPoisoned      bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
 	curFrameGapped   bool   // strict mode: a forward frag_idx jump happened in the current frame
+	curIDRGapped     bool   // strict mode: IDR buffer is missing fragments
+	lastPFrameTs     uint32 // last P-frame's trailer ts, used to derive IDR PTS
+	frameDumpCount   int
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it
@@ -778,107 +781,110 @@ func (c *Client) emit(e *pendingFrag) {
 		c.emitAudioSeq++
 		return
 	}
-	// The camera transports ONE H.264 elementary stream over two inner
-	// channels: 0x05 carries the keyframe NALs (SPS+PPS+SEI+IDR) and
-	// 0x07 carries the P-slice NALs.  Both are interleaved by sub_idx
-	// and must be reassembled together; filtering to just one channel
-	// gives you a string of keyframes or a string of orphaned P-frames
-	// (the AU detector then sees no new start code, curBuf grows, and
-	// playback degrades to ~1 fps).
+	// The camera transports the H.264 stream over two inner channels
+	// with DIFFERENT structure:
+	//
+	//   * 0x05 (main): IDR keyframe split across many ~1 KB fragments
+	//     (SPS + PPS + SEI + IDR slice).  No trailer on these — the
+	//     IDR is complete when the next 0x07 P-frame arrives.
+	//
+	//   * 0x07 (sub):  each P-frame is a SINGLE fragment of ~14-200
+	//     bytes carrying its own start code + slice + 15-byte trailer
+	//     with the per-frame ms timestamp.
+	//
+	// Concatenating both into one buffer merges the IDR and the first
+	// P-frame into a single AU and produces decoder errors.
 	if e.channel != innerChMain && e.channel != innerChSub {
 		return
 	}
 	c.stats.vidFrags++
-	// `inner[28..31]` was documented in PROTOCOL_NOTES as a per-frame
-	// counter, but on this firmware it changes far slower than the
-	// SPS-declared 25 fps — empirically once per GOP (~1 Hz).  Using
-	// it as the AU boundary gave us slideshow playback.  Track it
-	// for stats only.
 	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum {
 		c.stats.vidFramesIn++
-		c.expectFragIdx = 0
 	}
 	c.curFrameNum = e.frameNum
 	payload, frameTs, hasTs := stripFragmentMetadataTrailer(e.payload)
-
-	if hasTs {
-		c.pendingFrameTs = frameTs
-		c.havePendingTs = true
-		// Trailer fragments use frag_idx as an end-marker, not a
-		// sequential index — don't run gap detection on them.
-	} else {
-		// frag_idx resets at every H.264 frame boundary.
-		switch {
-		case e.fragIdx < c.expectFragIdx:
-			// New frame starting.  In strict mode, if the previous
-			// frame was still being assembled (we never saw its
-			// trailer), discard it — it was truncated by loss.
-			if c.strict && len(c.curBuf) > 0 {
-				c.stats.vidDropped++
-				c.curBuf = c.curBuf[:0]
-			}
-			c.curFrameGapped = false
-			// And: if the new frame's first fragment we see is NOT
-			// frag_idx=0, we missed its start — mark this frame
-			// gapped too.
-			if e.fragIdx > 0 {
-				c.stats.fragSkips++
-				c.stats.fragsLost += uint64(e.fragIdx)
-				if c.strict {
-					c.curFrameGapped = true
-				}
-			}
-		case e.fragIdx > c.expectFragIdx:
-			// Forward jump = UDP loss inside a frame.
-			c.stats.fragSkips++
-			c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
-			if c.strict {
-				c.curFrameGapped = true
-			}
-		}
-		c.expectFragIdx = e.fragIdx + 1
-	}
-
 	if c.dumpFile != nil {
 		_, _ = c.dumpFile.Write(payload)
 	}
-	c.curBuf = append(c.curBuf, payload...)
 
-	if c.strict {
-		// Trailer-aligned per-frame emission.  If a frame had a gap,
-		// poison the whole GOP — every subsequent P-frame would have
-		// broken references back to the dropped frame, producing
-		// cascading decoder errors.  Resume emission at the next IDR.
-		if hasTs {
-			frameIsKey := containsNALType(c.curBuf, 5)
-			if frameIsKey {
-				// Fresh IDR clears any prior poison — the next GOP
-				// can be decoded on its own.
-				c.gopPoisoned = c.curFrameGapped
-			} else if c.curFrameGapped {
-				c.gopPoisoned = true
-			}
-			if c.gopPoisoned {
-				c.stats.vidDropped++
-				c.curBuf = c.curBuf[:0]
-			} else if len(c.curBuf) > 0 {
-				c.emitAU(append([]byte(nil), c.curBuf...))
-				c.curBuf = c.curBuf[:0]
-			}
-			c.curFrameGapped = false
-			c.expectFragIdx = 0
+	if e.channel == innerChSub {
+		// Single-fragment P-frame.  Before emitting it, flush any
+		// pending IDR sitting in the main buffer — the IDR is done
+		// the moment the first P-frame arrives.
+		if !hasTs {
+			// Sub-channel fragment without trailer is unusual; treat
+			// as background noise and ignore.
+			return
 		}
+		if len(c.curBuf) > 0 {
+			c.flushIDR(frameTs)
+		}
+		if c.strict && c.gopPoisoned {
+			c.stats.vidDropped++
+			return
+		}
+		c.pendingFrameTs = frameTs
+		c.havePendingTs = true
+		c.emitAU(payload)
 		return
 	}
 
-	// Loose mode: byte-scan for AU boundaries.  This emits a
-	// frame as soon as the next slice's start code arrives, so we
-	// get higher fps under loss but propagate decoder errors when
-	// a fragment is missing.
-	if hasTs {
-		c.expectFragIdx = 0
+	// Main channel: accumulate IDR fragments.  Track frag_idx gaps
+	// for strict-mode GOP poisoning.
+	switch {
+	case e.fragIdx < c.expectFragIdx:
+		// A drop in frag_idx means a new IDR started.  If the
+		// previous IDR was still being assembled (no P-frame had
+		// arrived to flush it yet), it's complete now.
+		if len(c.curBuf) > 0 {
+			c.flushIDR(c.lastPFrameTs)
+		}
+		c.curIDRGapped = false
+		if e.fragIdx > 0 {
+			// We missed the start of this IDR.
+			c.stats.fragSkips++
+			c.stats.fragsLost += uint64(e.fragIdx)
+			if c.strict {
+				c.curIDRGapped = true
+			}
+		}
+	case e.fragIdx > c.expectFragIdx:
+		c.stats.fragSkips++
+		c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+		if c.strict {
+			c.curIDRGapped = true
+		}
 	}
-	c.tryEmitAU()
+	c.expectFragIdx = e.fragIdx + 1
+	c.curBuf = append(c.curBuf, payload...)
+}
+
+// flushIDR emits the accumulated main-channel keyframe buffer as one
+// access unit.  Called when the first P-frame of the GOP arrives (or a
+// new IDR begins).  The IDR has no trailer of its own, so its PTS is
+// derived as `nextPFrameTs - one frame interval`.
+func (c *Client) flushIDR(nextPFrameTs uint32) {
+	au := c.curBuf
+	c.curBuf = c.curBuf[:0]
+	if len(au) == 0 {
+		return
+	}
+	if c.strict && c.curIDRGapped {
+		c.gopPoisoned = true
+		c.stats.vidDropped++
+		c.curIDRGapped = false
+		return
+	}
+	// Fresh IDR resets GOP-poisoned state — the next GOP can be
+	// decoded on its own.
+	c.gopPoisoned = false
+	c.curIDRGapped = false
+	// 40 ms = one frame at 25 fps; use that as the IDR's PTS offset.
+	idrTs := nextPFrameTs - 40
+	c.pendingFrameTs = idrTs
+	c.havePendingTs = true
+	c.emitAU(append([]byte(nil), au...))
+	c.lastPFrameTs = nextPFrameTs
 }
 
 // tryEmitAU scans curBuf for complete access units and emits them.
