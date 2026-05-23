@@ -94,18 +94,15 @@ type Client struct {
 	closeOnce sync.Once
 	closeMu   sync.Mutex
 
-	audio          bool
-	quality        string
-	disableSub     bool
-	strict         bool
-	verbose        bool
-	curFrameNum    uint32 // camera frame counter of the AU currently being assembled
-	curAUTotal     uint16 // inner[20]: total fragments advertised for the current frame
-	curAUDataCount uint16 // count of fragIdx<16 fragments received for current frame
-	curAUGapped    bool   // a fragIdx gap was detected in the current frame
-	expectFragIdx  uint16 // next frag_idx we expect within the current frame
-	gopPoisoned    bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
-	lastPFrameTs   uint32 // last P-frame's trailer ts (kept for legacy callers)
+	audio        bool
+	quality      string
+	disableSub   bool
+	strict       bool
+	verbose      bool
+	mainAsm      channelAsm // per-channel assembly state for ch=0x05
+	subAsm       channelAsm // per-channel assembly state for ch=0x07
+	gopPoisoned  bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
+	lastPFrameTs uint32 // last P-frame's trailer ts (kept for legacy callers)
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it
@@ -151,6 +148,28 @@ type pendingFrag struct {
 	fragIdx    uint16 // index of fragment within frame (inner[22..23])
 	totalFrags byte   // total fragments comprising this frame (inner[20])
 	payload    []byte
+}
+
+// channelAsm holds the assembly state for a single video channel.  The
+// camera interleaves IDR fragments on ch=0x05 with P-frame fragments
+// on ch=0x07 in wire order, so they MUST be assembled independently —
+// a single shared buffer would constantly drop partial frames whenever
+// the channels switch.
+type channelAsm struct {
+	buf           []byte
+	curFrameNum   uint32
+	curAUTotal    uint16 // inner[20]: total fragments advertised for current frame
+	curAUDataCount uint16
+	curAUGapped   bool
+	expectFragIdx uint16
+}
+
+func (a *channelAsm) reset() {
+	a.buf = a.buf[:0]
+	a.curAUTotal = 0
+	a.curAUDataCount = 0
+	a.curAUGapped = false
+	a.expectFragIdx = 0
 }
 
 // Dial opens a UDP socket, runs LAN_SEARCH3 + KNOCK2 + DTLS-shaped +
@@ -785,8 +804,7 @@ func (c *Client) forceDrain() {
 //   * 0..N-1 "data" fragments containing slice bytes, paylen=1024 each
 //     (except possibly the last one); no trailer.
 //   * 1 final "end" fragment with a smaller paylen, ending in the
-//     15-byte ms-timestamp trailer — variant `00 00 00 01 ...` for
-//     P-frames, `00 01 00 01 ...` for IDR keyframes.
+//     16-byte metadata block (codec_id 0x4e + 15-byte ms-ts trailer).
 //
 // The end fragment is identified by the trailer signature on its
 // payload tail, NOT by fragIdx (which can wrap when N>16 and reuse
@@ -794,10 +812,12 @@ func (c *Client) forceDrain() {
 // total fragment count, so loss of the trailing data fragment — which
 // fragIdx gaps cannot see — is also detectable.
 //
-// Both ch=0x05 (carries the IDR for the current quality) and ch=0x07
-// (carries P-frames) follow this format and share a single frame
-// counter (inner[28..31]); they're a single time-ordered stream split
-// across two channel ids, never interleaved.
+// CRITICAL: the camera time-multiplexes IDR fragments on ch=0x05 with
+// P-frame fragments on ch=0x07 in WIRE ORDER — e.g. mid-IDR a P-frame
+// can arrive.  Each channel MUST have its own assembly buffer or the
+// constant frame_num switching would drop every partial IDR.  Both
+// channels' completed frames are emitted into one PTS-ordered output
+// stream though, since they share the camera's frame_num counter.
 func (c *Client) emit(e *pendingFrag) {
 	if c.startedAt.IsZero() {
 		c.startedAt = time.Now()
@@ -816,46 +836,21 @@ func (c *Client) emit(e *pendingFrag) {
 	if e.channel != innerChMain && e.channel != innerChSub {
 		return
 	}
-	// Per live capture (HD config): ch=0x05 carries IDR keyframes
-	// (multi-fragment, every ~60 frames), ch=0x07 carries P-frames
-	// (single fragment each).  They share the same frame_num counter,
-	// so the two channels together describe ONE stream — accept both
-	// regardless of opts.Quality.  We handle them differently below:
-	// ch=0x05 fragments accumulate; ch=0x07 single fragments emit
-	// immediately (after flushing any pending IDR).
 	c.stats.vidFrags++
 
-	// New frame_num while we still have a partial buffer means the
-	// previous frame's end fragment was lost.  Discard the partial —
-	// in strict mode also poison the GOP, since a truncated P-frame
-	// cascades errors through every later one.
-	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum && len(c.curBuf) > 0 {
-		c.stats.fragSkips++
-		c.stats.fragsLost++
-		c.stats.vidDropped++
-		if c.strict {
-			c.gopPoisoned = true
-		}
-		c.curBuf = c.curBuf[:0]
-		c.curAUTotal = 0
-		c.curAUDataCount = 0
-		c.curAUGapped = false
-		c.expectFragIdx = 0
-	}
-	if e.frameNum != c.curFrameNum {
-		c.curFrameNum = e.frameNum
-		c.stats.vidFramesIn++
-		c.expectFragIdx = 0
-		c.curAUGapped = false
-		c.curAUDataCount = 0
-		c.curAUTotal = uint16(e.totalFrags)
-	}
-	if c.curAUTotal == 0 && e.totalFrags != 0 {
-		c.curAUTotal = uint16(e.totalFrags)
-	}
+	// This firmware variant:
+	//   ch=0x05 IDR fragments arrive WITHOUT a trailer-bearing end
+	//     fragment.  All ~16 (small) or ~75 (big) data fragments come
+	//     in order, then the next thing on the wire is a ch=0x07
+	//     P-frame.  The arrival of a ch=0x07 fragment signals that
+	//     the preceding ch=0x05 IDR is complete.
+	//   ch=0x07 P-frames are single-fragment, each with a trailer.
+	//
+	// Older firmware (PCAPdroid pcap) DID put an end fragment with
+	// trailer on ch=0x05 IDRs.  The code handles both: detect end via
+	// trailer signature if present, otherwise flush the IDR on the
+	// next ch=0x07 arrival.
 
-	// End-of-frame is the fragment whose payload tail matches the
-	// 15-byte trailer signature (P-frame or keyframe variant).
 	stripped, frameTs, hasTrailer := stripFragmentMetadataTrailer(e.payload)
 	if c.dumpFile != nil {
 		if hasTrailer {
@@ -865,56 +860,80 @@ func (c *Client) emit(e *pendingFrag) {
 		}
 	}
 
-	if !hasTrailer {
-		// Data fragment.  Track fragIdx gaps for diagnostics — these
-		// reveal mid-frame UDP loss, which strict mode escalates into
-		// a GOP poison.  Don't trip the gap when fragIdx happens to
-		// equal 16 inside a frame longer than 16 fragments: the camera
-		// reuses the value, so it's expected to appear out of strict
-		// order.
-		if e.fragIdx != c.expectFragIdx && e.fragIdx != 16 {
+	asm := &c.mainAsm
+	if e.channel == innerChSub {
+		asm = &c.subAsm
+	}
+
+	// Frame_num change on THIS channel without a clean end fragment
+	// means the end was lost (only meaningful for ch=0x07; ch=0x05
+	// IDRs may legitimately end via cross-channel flush, handled
+	// below).
+	if asm.curFrameNum != 0 && e.frameNum != asm.curFrameNum && len(asm.buf) > 0 {
+		if e.channel == innerChSub {
 			c.stats.fragSkips++
-			if e.fragIdx > c.expectFragIdx {
-				c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+			c.stats.fragsLost++
+			c.stats.vidDropped++
+			if c.strict {
+				c.gopPoisoned = true
+			}
+		}
+		asm.reset()
+	}
+	if e.frameNum != asm.curFrameNum {
+		asm.curFrameNum = e.frameNum
+		c.stats.vidFramesIn++
+		asm.expectFragIdx = 0
+		asm.curAUGapped = false
+		asm.curAUDataCount = 0
+		asm.curAUTotal = uint16(e.totalFrags)
+	}
+	if asm.curAUTotal == 0 && e.totalFrags != 0 {
+		asm.curAUTotal = uint16(e.totalFrags)
+	}
+
+	// ch=0x07 arrival: flush any pending ch=0x05 IDR first (its end
+	// fragment never came on this firmware), then process this P-frame.
+	if e.channel == innerChSub && len(c.mainAsm.buf) > 0 {
+		c.flushMainIDR(frameTs)
+	}
+
+	if !hasTrailer {
+		// Data fragment.  fragIdx==16 is exempt from gap-detection
+		// because the camera reuses it as a position index when N>16.
+		if e.fragIdx != asm.expectFragIdx && e.fragIdx != 16 {
+			c.stats.fragSkips++
+			if e.fragIdx > asm.expectFragIdx {
+				c.stats.fragsLost += uint64(e.fragIdx - asm.expectFragIdx)
 			} else {
 				c.stats.fragsLost++
 			}
-			c.curAUGapped = true
+			asm.curAUGapped = true
 		}
-		c.expectFragIdx = e.fragIdx + 1
-		c.curAUDataCount++
-		c.curBuf = append(c.curBuf, e.payload...)
+		asm.expectFragIdx = e.fragIdx + 1
+		asm.curAUDataCount++
+		asm.buf = append(asm.buf, e.payload...)
 		return
 	}
 
-	// End-of-frame fragment.  Append the trailer-stripped payload and
-	// emit (or drop in strict mode if we know fragments were lost).
-	c.curBuf = append(c.curBuf, stripped...)
+	// End-of-frame fragment.  Append trailer-stripped payload and emit.
+	asm.buf = append(asm.buf, stripped...)
 	expectedData := uint16(0)
-	if c.curAUTotal > 0 {
-		expectedData = c.curAUTotal - 1 // minus the end fragment itself
+	if asm.curAUTotal > 0 {
+		expectedData = asm.curAUTotal - 1
 	}
-	if c.curAUDataCount < expectedData {
-		// We didn't see all the data fragments the camera advertised.
-		// This catches loss of the LAST data fragment, which fragIdx
-		// gap detection cannot see (no successor follows it).
-		lost := uint64(expectedData - c.curAUDataCount)
+	if asm.curAUDataCount < expectedData {
+		lost := uint64(expectedData - asm.curAUDataCount)
 		c.stats.fragSkips++
 		c.stats.fragsLost += lost
-		c.curAUGapped = true
+		asm.curAUGapped = true
 	}
 
-	au := append([]byte(nil), c.curBuf...)
-	gapped := c.curAUGapped
+	au := append([]byte(nil), asm.buf...)
+	gapped := asm.curAUGapped
 	wasMain := e.channel == innerChMain
-
-	// Reset assembly state for the next frame.
-	c.curBuf = c.curBuf[:0]
-	c.curAUDataCount = 0
-	c.curAUTotal = 0
-	c.curAUGapped = false
-	c.expectFragIdx = 0
-	c.curFrameNum = 0
+	asm.reset()
+	asm.curFrameNum = 0
 
 	if c.strict && gapped {
 		c.gopPoisoned = true
@@ -931,6 +950,41 @@ func (c *Client) emit(e *pendingFrag) {
 	if c.strict && c.gopPoisoned && !wasMain {
 		c.stats.vidDropped++
 		return
+	}
+	c.emitAU(au)
+}
+
+// flushMainIDR emits the accumulated ch=0x05 IDR buffer as an AU.
+// Called from emit() when a ch=0x07 P-frame arrives — on the firmware
+// where ch=0x05 IDRs have no end-fragment, this cross-channel signal
+// is the only completion indicator we get.  PTS comes from the
+// following P-frame's trailer minus one frame interval (40 ms @ 25 fps).
+func (c *Client) flushMainIDR(nextPFrameTs uint32) {
+	au := append([]byte(nil), c.mainAsm.buf...)
+	gapped := c.mainAsm.curAUGapped
+	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount < c.mainAsm.curAUTotal {
+		// We never reached inner[20]'s advertised total; tail data
+		// fragments may have been lost (or the firmware doesn't send
+		// the end fragment at all for some IDR sizes — both lead to a
+		// truncated slice).
+		c.stats.fragSkips++
+		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - c.mainAsm.curAUDataCount)
+		gapped = true
+	}
+	c.mainAsm.reset()
+	c.mainAsm.curFrameNum = 0
+	if len(au) == 0 {
+		return
+	}
+	if c.strict && gapped {
+		c.gopPoisoned = true
+		c.stats.vidDropped++
+		return
+	}
+	if nextPFrameTs != 0 {
+		idrTs := nextPFrameTs - 40 // assume 1 frame @ 25 fps lead
+		c.pendingFrameTs = idrTs
+		c.havePendingTs = true
 	}
 	c.emitAU(au)
 }
@@ -1003,19 +1057,21 @@ func (c *Client) emitAU(au []byte) {
 // each frame.  The block is `<codec_id 1B> <variant prefix 4B>
 // <7B zeros> <4B LE ms ts>`:
 //
-//	P-frame:  4e  00 00 00 01  00 00 00 00 00 00 00  <ts>
-//	IDR/key:  4e  00 01 00 01  00 00 00 00 00 00 00  <ts>
+//	P-frame:  4e  00 <p_or_k> 00 <stream_id>  00*7  <ts>
+//	IDR/key:  4e  00 <p_or_k> 00 <stream_id>  00*7  <ts>
 //
-// codec_id is 0x4e (= CodecH264) for video.  Verified 0x4e in 725/725
-// end fragments of PCAPdroid_22_May_08_31_19.pcap.  Five of those
-// fragments had paylen == 16, meaning the whole payload IS the
-// metadata block (zero slice bytes — the entire frame's slice data
-// was in earlier fragments).
+// codec_id is 0x4e (= CodecH264) for video.  Byte 1 of the variant
+// prefix is 0x00 for P-frames and 0x01 for IDR keyframes.  Byte 3 is
+// a small non-zero stream identifier — observed values:
+//   * 0x01 — PCAPdroid pcap recording (different camera firmware)
+//   * 0x02 — current live PLAF203 firmware
+// We accept any small (1..15) value at byte 3 so we don't get bitten
+// the next time the camera firmware reassigns the id.
 //
-// Stripping only the 15 trailer bytes leaves the 0x4e in the slice
-// tail.  Decoders read it as the start of a NAL-14 (SVC prefix unit)
-// without a preceding start code and bail on the NEXT frame with
-// "mb_skip_run invalid at MB 0,0".  Strip all 16 bytes.
+// Stripping only 15 trailer bytes would leave the 0x4e codec_id in
+// the slice tail; decoders read it as a stray NAL-14 prefix and bail
+// on the next frame with "mb_skip_run invalid at MB 0,0".  Strip all
+// 16 bytes.
 //
 // Callers should only invoke this on the frame's end fragment (whose
 // tail unambiguously matches the signature) — in mid-frame fragments
@@ -1025,8 +1081,8 @@ func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs b
 		return p, 0, false
 	}
 	t := p[len(p)-15:] // 15-byte trailer right after the codec_id byte
-	prefixOK := (t[0] == 0x00 && t[1] == 0x00 && t[2] == 0x00 && t[3] == 0x01) ||
-		(t[0] == 0x00 && t[1] == 0x01 && t[2] == 0x00 && t[3] == 0x01)
+	prefixOK := t[0] == 0x00 && (t[1] == 0x00 || t[1] == 0x01) &&
+		t[2] == 0x00 && t[3] >= 0x01 && t[3] <= 0x0f
 	zerosOK := t[4] == 0 && t[5] == 0 && t[6] == 0 && t[7] == 0 &&
 		t[8] == 0 && t[9] == 0 && t[10] == 0
 	codecIDOK := p[len(p)-16] == CodecH264
