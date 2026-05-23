@@ -838,6 +838,15 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.stats.vidFrags++
 
+	// EXPERIMENTAL: this firmware sends BOTH ~16-fragment SD IDRs
+	// and ~75-fragment HD IDRs interleaved on ch=0x05.  The two
+	// resolutions confuse downstream decoders.  Drop the small SD
+	// IDR's data fragments so probe / decoder lock onto the HD SPS.
+	// ch=0x07 P-frames (f20=1) are always kept.
+	if e.channel == innerChMain && e.totalFrags > 0 && e.totalFrags < 30 {
+		return
+	}
+
 	// This firmware variant:
 	//   ch=0x05 IDR fragments arrive WITHOUT a trailer-bearing end
 	//     fragment.  All ~16 (small) or ~75 (big) data fragments come
