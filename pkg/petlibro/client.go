@@ -33,6 +33,14 @@ const (
 	CodecAACADTS byte = 0x87
 )
 
+// Small frames (≤16 data fragments) end with a fragment whose fragIdx
+// equals 16; longer frames overrun that and reuse fragIdx=16 as the
+// final marker AGAIN.  So fragIdx alone can't separate "middle
+// fragment that happened to land at index 16" from "end fragment".
+// The reliable end-of-frame detector is the 15-byte ms-timestamp
+// trailer (see stripFragmentMetadataTrailer) — 84 fixed bits of
+// signature put coincidental matches in the 1-in-2^84 zone.
+
 // Packet is one fully-assembled media frame from the camera.
 type Packet struct {
 	Codec      byte
@@ -86,22 +94,19 @@ type Client struct {
 	closeOnce sync.Once
 	closeMu   sync.Mutex
 
-	audio           bool
-	quality         string
-	disableSub      bool
-	strict          bool
-	verbose         bool
-	videoChannel    byte   // inner-channel byte of the video stream we consume
-	curFrameNum     uint32 // camera frame counter of the AU currently being assembled
-	curAUIncomplete  bool   // true if a frag_idx gap occurred during the current AU
-	curAUWasKeyframe bool   // current AU begins with SPS (drop on loss to avoid GOP poison)
-	expectFragIdx    uint16 // next frag_idx we expect within the current frame
-	bufHigh          int    // diag: largest curBuf seen since last emit
-	gopPoisoned      bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
-	curFrameGapped   bool   // strict mode: a forward frag_idx jump happened in the current frame
-	curIDRGapped     bool   // strict mode: IDR buffer is missing fragments
-	lastPFrameTs     uint32 // last P-frame's trailer ts, used to derive IDR PTS
-	frameDumpCount   int
+	audio          bool
+	quality        string
+	disableSub     bool
+	strict         bool
+	verbose        bool
+	videoChannel   byte   // inner-channel byte of the video stream we consume
+	curFrameNum    uint32 // camera frame counter of the AU currently being assembled
+	curAUTotal     uint16 // inner[20]: total fragments advertised for the current frame
+	curAUDataCount uint16 // count of fragIdx<16 fragments received for current frame
+	curAUGapped    bool   // a fragIdx gap was detected in the current frame
+	expectFragIdx  uint16 // next frag_idx we expect within the current frame
+	gopPoisoned    bool   // strict mode: a fragment was lost in this GOP — drop until next IDR
+	lastPFrameTs   uint32 // last P-frame's trailer ts (kept for legacy callers)
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it
@@ -138,13 +143,14 @@ type counters struct {
 }
 
 type pendingFrag struct {
-	channel  byte
-	b1       byte
-	isAudio  bool   // true for either audio variant (channels 0x03 or 0x07/b1=0x0d)
-	subExt   uint64
-	frameNum uint32 // camera's per-channel frame counter (inner[28..31])
-	fragIdx  uint16 // index of fragment within frame (inner[22..23])
-	payload  []byte
+	channel    byte
+	b1         byte
+	isAudio    bool   // true for either audio variant (channels 0x03 or 0x07/b1=0x0d)
+	subExt     uint64
+	frameNum   uint32 // camera's per-channel frame counter (inner[28..31])
+	fragIdx    uint16 // index of fragment within frame (inner[22..23])
+	totalFrags byte   // total fragments comprising this frame (inner[20])
+	payload    []byte
 }
 
 // Dial opens a UDP socket, runs LAN_SEARCH3 + KNOCK2 + DTLS-shaped +
@@ -709,9 +715,14 @@ func (c *Client) handleIncoming(pkt []byte) {
 	if len(inner) >= 24 {
 		fragIdx = binary.LittleEndian.Uint16(inner[22:])
 	}
+	var totalFrags byte
+	if len(inner) >= 21 {
+		totalFrags = inner[20] // PROTOCOL_NOTES: total fragments in this frame
+	}
 	c.avBuffer[subExt] = &pendingFrag{
 		channel: channel, b1: b1, isAudio: isAudio,
-		subExt: subExt, frameNum: frameNum, fragIdx: fragIdx, payload: payload,
+		subExt: subExt, frameNum: frameNum, fragIdx: fragIdx,
+		totalFrags: totalFrags, payload: payload,
 	}
 	c.drainContiguous()
 }
@@ -761,11 +772,24 @@ func (c *Client) forceDrain() {
 	}
 }
 
-// emit handles one in-order entry.  Petlibro's b1 fragment-tag (00/04/05)
-// turns out to be transport-level, NOT H.264 access-unit boundaries — a
-// single AU can span many "frames" in petlibro's terms.  Instead we
-// concatenate all video bytes into a rolling buffer and scan for proper
-// H.264 Annex-B AU start markers (SPS or non-IDR slice) to delimit AUs.
+// emit handles one in-order entry.  Frame structure on the wire:
+//
+//   * 0..N-1 "data" fragments containing slice bytes, paylen=1024 each
+//     (except possibly the last one); no trailer.
+//   * 1 final "end" fragment with a smaller paylen, ending in the
+//     15-byte ms-timestamp trailer — variant `00 00 00 01 ...` for
+//     P-frames, `00 01 00 01 ...` for IDR keyframes.
+//
+// The end fragment is identified by the trailer signature on its
+// payload tail, NOT by fragIdx (which can wrap when N>16 and reuse
+// "16" both as a data index and the end marker).  inner[20] gives the
+// total fragment count, so loss of the trailing data fragment — which
+// fragIdx gaps cannot see — is also detectable.
+//
+// Both ch=0x05 (carries the IDR for the current quality) and ch=0x07
+// (carries P-frames) follow this format and share a single frame
+// counter (inner[28..31]); they're a single time-ordered stream split
+// across two channel ids, never interleaved.
 func (c *Client) emit(e *pendingFrag) {
 	if c.startedAt.IsZero() {
 		c.startedAt = time.Now()
@@ -781,181 +805,119 @@ func (c *Client) emit(e *pendingFrag) {
 		c.emitAudioSeq++
 		return
 	}
-	// The camera transports the H.264 stream over two inner channels
-	// with DIFFERENT structure:
-	//
-	//   * 0x05 (main): IDR keyframe split across many ~1 KB fragments
-	//     (SPS + PPS + SEI + IDR slice).  No trailer on these — the
-	//     IDR is complete when the next 0x07 P-frame arrives.
-	//
-	//   * 0x07 (sub):  each P-frame is a SINGLE fragment of ~14-200
-	//     bytes carrying its own start code + slice + 15-byte trailer
-	//     with the per-frame ms timestamp.
-	//
-	// Concatenating both into one buffer merges the IDR and the first
-	// P-frame into a single AU and produces decoder errors.
 	if e.channel != innerChMain && e.channel != innerChSub {
 		return
 	}
 	c.stats.vidFrags++
-	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum {
-		c.stats.vidFramesIn++
-	}
-	c.curFrameNum = e.frameNum
-	payload, frameTs, hasTs := stripFragmentMetadataTrailer(e.payload)
-	if c.dumpFile != nil {
-		_, _ = c.dumpFile.Write(payload)
-	}
 
-	if e.channel == innerChSub {
-		// Single-fragment P-frame.  Before emitting it, flush any
-		// pending IDR sitting in the main buffer — the IDR is done
-		// the moment the first P-frame arrives.
-		if !hasTs {
-			// Sub-channel fragment without trailer is unusual; treat
-			// as background noise and ignore.
-			return
-		}
-		if len(c.curBuf) > 0 {
-			c.flushIDR(frameTs)
-		}
-		if c.strict && c.gopPoisoned {
-			c.stats.vidDropped++
-			return
-		}
-		c.pendingFrameTs = frameTs
-		c.havePendingTs = true
-		c.emitAU(payload)
-		return
-	}
-
-	// Main channel: accumulate IDR fragments.  Track frag_idx gaps
-	// for strict-mode GOP poisoning.
-	switch {
-	case e.fragIdx < c.expectFragIdx:
-		// A drop in frag_idx means a new IDR started.  If the
-		// previous IDR was still being assembled (no P-frame had
-		// arrived to flush it yet), it's complete now.
-		if len(c.curBuf) > 0 {
-			c.flushIDR(c.lastPFrameTs)
-		}
-		c.curIDRGapped = false
-		if e.fragIdx > 0 {
-			// We missed the start of this IDR.
-			c.stats.fragSkips++
-			c.stats.fragsLost += uint64(e.fragIdx)
-			if c.strict {
-				c.curIDRGapped = true
-			}
-		}
-	case e.fragIdx > c.expectFragIdx:
+	// New frame_num while we still have a partial buffer means the
+	// previous frame's end fragment was lost.  Discard the partial —
+	// in strict mode also poison the GOP, since a truncated P-frame
+	// cascades errors through every later one.
+	if c.curFrameNum != 0 && e.frameNum != c.curFrameNum && len(c.curBuf) > 0 {
 		c.stats.fragSkips++
-		c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+		c.stats.fragsLost++
+		c.stats.vidDropped++
 		if c.strict {
-			c.curIDRGapped = true
+			c.gopPoisoned = true
+		}
+		c.curBuf = c.curBuf[:0]
+		c.curAUTotal = 0
+		c.curAUDataCount = 0
+		c.curAUGapped = false
+		c.expectFragIdx = 0
+	}
+	if e.frameNum != c.curFrameNum {
+		c.curFrameNum = e.frameNum
+		c.stats.vidFramesIn++
+		c.expectFragIdx = 0
+		c.curAUGapped = false
+		c.curAUDataCount = 0
+		c.curAUTotal = uint16(e.totalFrags)
+	}
+	if c.curAUTotal == 0 && e.totalFrags != 0 {
+		c.curAUTotal = uint16(e.totalFrags)
+	}
+
+	// End-of-frame is the fragment whose payload tail matches the
+	// 15-byte trailer signature (P-frame or keyframe variant).
+	stripped, frameTs, hasTrailer := stripFragmentMetadataTrailer(e.payload)
+	if c.dumpFile != nil {
+		if hasTrailer {
+			_, _ = c.dumpFile.Write(stripped)
+		} else {
+			_, _ = c.dumpFile.Write(e.payload)
 		}
 	}
-	c.expectFragIdx = e.fragIdx + 1
-	c.curBuf = append(c.curBuf, payload...)
-}
 
-// flushIDR emits the accumulated main-channel keyframe buffer as one
-// access unit.  Called when the first P-frame of the GOP arrives (or a
-// new IDR begins).  The IDR has no trailer of its own, so its PTS is
-// derived as `nextPFrameTs - one frame interval`.
-func (c *Client) flushIDR(nextPFrameTs uint32) {
-	au := c.curBuf
-	c.curBuf = c.curBuf[:0]
-	if len(au) == 0 {
+	if !hasTrailer {
+		// Data fragment.  Track fragIdx gaps for diagnostics — these
+		// reveal mid-frame UDP loss, which strict mode escalates into
+		// a GOP poison.  Don't trip the gap when fragIdx happens to
+		// equal 16 inside a frame longer than 16 fragments: the camera
+		// reuses the value, so it's expected to appear out of strict
+		// order.
+		if e.fragIdx != c.expectFragIdx && e.fragIdx != 16 {
+			c.stats.fragSkips++
+			if e.fragIdx > c.expectFragIdx {
+				c.stats.fragsLost += uint64(e.fragIdx - c.expectFragIdx)
+			} else {
+				c.stats.fragsLost++
+			}
+			c.curAUGapped = true
+		}
+		c.expectFragIdx = e.fragIdx + 1
+		c.curAUDataCount++
+		c.curBuf = append(c.curBuf, e.payload...)
 		return
 	}
-	if c.strict && c.curIDRGapped {
+
+	// End-of-frame fragment.  Append the trailer-stripped payload and
+	// emit (or drop in strict mode if we know fragments were lost).
+	c.curBuf = append(c.curBuf, stripped...)
+	expectedData := uint16(0)
+	if c.curAUTotal > 0 {
+		expectedData = c.curAUTotal - 1 // minus the end fragment itself
+	}
+	if c.curAUDataCount < expectedData {
+		// We didn't see all the data fragments the camera advertised.
+		// This catches loss of the LAST data fragment, which fragIdx
+		// gap detection cannot see (no successor follows it).
+		lost := uint64(expectedData - c.curAUDataCount)
+		c.stats.fragSkips++
+		c.stats.fragsLost += lost
+		c.curAUGapped = true
+	}
+
+	au := append([]byte(nil), c.curBuf...)
+	gapped := c.curAUGapped
+	wasMain := e.channel == innerChMain
+
+	// Reset assembly state for the next frame.
+	c.curBuf = c.curBuf[:0]
+	c.curAUDataCount = 0
+	c.curAUTotal = 0
+	c.curAUGapped = false
+	c.expectFragIdx = 0
+	c.curFrameNum = 0
+
+	if c.strict && gapped {
 		c.gopPoisoned = true
 		c.stats.vidDropped++
-		c.curIDRGapped = false
 		return
 	}
-	// Fresh IDR resets GOP-poisoned state — the next GOP can be
-	// decoded on its own.
-	c.gopPoisoned = false
-	c.curIDRGapped = false
-	// 40 ms = one frame at 25 fps; use that as the IDR's PTS offset.
-	idrTs := nextPFrameTs - 40
-	c.pendingFrameTs = idrTs
+	c.pendingFrameTs = frameTs
 	c.havePendingTs = true
-	c.emitAU(append([]byte(nil), au...))
-	c.lastPFrameTs = nextPFrameTs
-}
-
-// tryEmitAU scans curBuf for complete access units and emits them.
-// An AU is defined as the bytes between two AU-start markers (SPS or
-// non-IDR P-slice).  We need TWO start markers to know the first AU
-// is complete — otherwise we'd emit a truncated AU and corrupt the
-// trailing slice.  The (small) penalty: ~1 frame of latency.
-func (c *Client) tryEmitAU() {
-	for {
-		first := findAUStart(c.curBuf, 0)
-		if first < 0 {
-			return
-		}
-		if first > 0 {
-			// Drop everything before the first real NAL.
-			c.curBuf = c.curBuf[first:]
-		}
-		// Skip past the leading start code so we don't immediately
-		// re-find it.
-		skip := 4
-		if len(c.curBuf) >= 4 && !(c.curBuf[0] == 0 && c.curBuf[1] == 0 &&
-			c.curBuf[2] == 0 && c.curBuf[3] == 1) {
-			skip = 3
-		}
-		next := findAUStart(c.curBuf, skip)
-		if next < 0 {
-			// Debug: how big has curBuf grown without finding a 2nd AU?
-			if c.verbose && len(c.curBuf) > 0 && len(c.curBuf) > c.bufHigh+4096 {
-				c.bufHigh = len(c.curBuf)
-				head := c.curBuf
-				if len(head) > 48 {
-					head = head[:48]
-				}
-				fmt.Printf("[petlibro] curBuf grew to %d, no 2nd AU; head=%x\n",
-					len(c.curBuf), head)
-			}
-			return
-		}
-		c.bufHigh = 0
-		au := append([]byte(nil), c.curBuf[:next]...)
-		c.curBuf = c.curBuf[next:]
-		c.emitAU(au)
+	if !wasMain {
+		c.lastPFrameTs = frameTs
 	}
-}
-
-// findAUStart finds the byte offset of the next H.264 access unit
-// boundary in b at offset >= start.  An AU starts at an SPS NAL (type
-// 7) or a non-IDR slice (type 1).  Returns -1 if none found.
-func findAUStart(b []byte, start int) int {
-	for i := start; i+4 < len(b); i++ {
-		if b[i] != 0 || b[i+1] != 0 {
-			continue
-		}
-		var nalPos int
-		switch {
-		case b[i+2] == 1:
-			nalPos = i + 3
-		case b[i+2] == 0 && i+4 < len(b) && b[i+3] == 1:
-			nalPos = i + 4
-		default:
-			continue
-		}
-		if nalPos >= len(b) {
-			return -1
-		}
-		nal := b[nalPos] & 0x1F
-		if nal == 7 || nal == 1 {
-			return i
-		}
+	// In strict mode, drop P-frames in a poisoned GOP until the next
+	// IDR resyncs us.  emitAU resets gopPoisoned when it sees an IDR.
+	if c.strict && c.gopPoisoned && !wasMain {
+		c.stats.vidDropped++
+		return
 	}
-	return -1
+	c.emitAU(au)
 }
 
 // emitAU finalises one access unit and queues it for the consumer.
@@ -1020,33 +982,36 @@ func (c *Client) emitAU(au []byte) {
 
 // stripFragmentMetadataTrailer removes the 15-byte per-frame metadata
 // trailer the Petlibro firmware appends to the LAST video fragment of
-// each frame.  The trailer signature is:
+// each frame.  There are two variants of the structural prefix:
 //
-//	00 00 00 01  00 00 00 00 00 00 00  <4-byte LE millisecond counter>
+//	P-frame:  00 00 00 01  00 00 00 00 00 00 00  <4-byte LE ms ts>
+//	IDR/key:  00 01 00 01  00 00 00 00 00 00 00  <4-byte LE ms ts>
 //
-// The leading 4 bytes look like an Annex-B start code, but if the bytes
-// are fed to a strict H.264 decoder they parse as a NAL of type 0
-// ("unspecified") which is invalid.  We detect the structural prefix
-// (11 fixed bytes) and discard the whole 15-byte trailer at the
-// fragment boundary — well before the decoder ever sees it.
+// Both variants use 11 fixed bytes + a 4-byte millisecond counter.
+// Missing the keyframe variant (byte 1 = 0x01 instead of 0x00) was the
+// root cause of persistent bottom-MB-row decoder errors — the trailer
+// leaked into the IDR slice's tail and the decoder parsed garbage at
+// the very end of the slice.
 //
-// Stripping per-fragment (rather than scanning the merged AU buffer)
-// matters because the camera does NOT insert H.264 emulation-prevention
-// bytes, so the same byte signature occasionally appears inside slice
-// payload as a coincidence; an AU-level scanner would mistakenly cut
-// real slice bytes.  At the fragment tail there is no such ambiguity.
+// Callers should only invoke this on fragments where fragIdx == 16
+// (the explicit last-fragment marker).  At the frame tail the
+// signature is unambiguous; in mid-frame fragments a coincidental
+// match could shear real slice bytes.
 //
-// When a trailer is found, ts is the 4-byte LE millisecond counter from
-// the camera's frame clock — used downstream as the H.264 PTS so we
-// don't have to invent timestamps from wall clock.
+// When a trailer is found, ts is the 4-byte LE millisecond counter
+// from the camera's frame clock — used downstream as the H.264 PTS.
 func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs bool) {
 	if len(p) < 15 {
 		return p, 0, false
 	}
 	t := p[len(p)-15:]
-	if t[0] == 0 && t[1] == 0 && t[2] == 0 && t[3] == 1 &&
-		t[4] == 0 && t[5] == 0 && t[6] == 0 && t[7] == 0 &&
-		t[8] == 0 && t[9] == 0 && t[10] == 0 {
+	// Variant detector: byte[0..3] is either 00 00 00 01 (P-frame) or
+	// 00 01 00 01 (keyframe); byte[4..10] is always 7 zeros.
+	prefixOK := (t[0] == 0x00 && t[1] == 0x00 && t[2] == 0x00 && t[3] == 0x01) ||
+		(t[0] == 0x00 && t[1] == 0x01 && t[2] == 0x00 && t[3] == 0x01)
+	zerosOK := t[4] == 0 && t[5] == 0 && t[6] == 0 && t[7] == 0 &&
+		t[8] == 0 && t[9] == 0 && t[10] == 0
+	if prefixOK && zerosOK {
 		ts = binary.LittleEndian.Uint32(t[11:15])
 		return p[:len(p)-15], ts, true
 	}
