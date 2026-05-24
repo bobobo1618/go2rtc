@@ -1070,6 +1070,23 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 		c.stats.fragSkips++
 		c.stats.fragsLost += uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount)
 	}
+	// Petlibro firmware zero-pads each ch=0x05 fragment to 1024 bytes.
+	// The LAST fragment of the IDR slice carries fewer real bits than
+	// 1024 bytes worth and the remainder is padding.  The H.264 decoder
+	// reads those trailing zeros as additional slice bitstream data and
+	// fails at the bottom MB rows with "corrupted macroblock X 66" /
+	// "out of range intra chroma pred mode" — exactly the user-visible
+	// row 66-67 errors.  The fix: trim trailing zeros from the AU.
+	//
+	// This is safe because every valid H.264 NAL unit ends with
+	// rbsp_trailing_bits — at minimum one "1" bit (the stop bit) — so
+	// the last byte of valid slice data is always non-zero.  H.264's
+	// emulation-prevention rule also forbids three consecutive 0x00
+	// bytes inside the NAL, so trimming will never land inside real
+	// slice data.
+	for len(au) > 0 && au[len(au)-1] == 0 {
+		au = au[:len(au)-1]
+	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
 	if c.strict && (midGapped || tailMissing) {
