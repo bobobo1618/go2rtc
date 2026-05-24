@@ -1,14 +1,13 @@
 // Package petlibro is a clean-room LAN P2P client for Petlibro pet
 // cameras (PLAF203 / PLAF103 / etc).  These cameras run a Kalay/TUTK
 // firmware variant: same luffy crypto as Wyze (we reuse pkg/tutk's
-// TransCodePartial/ReverseTransCodePartial directly) but with a
-// different magic byte, direction byte, LOGIN structure and bootstrap
-// IOCtrl sequence — see PROTOCOL_NOTES.txt at the repo root for
-// the full byte-level docs.
+// TransCodePartial / ReverseTransCodePartial directly) but with a
+// different protocol-version byte, direction flag, LOGIN structure
+// and bootstrap IOCtrl sequence.
 //
 // Pkg layout:
 //
-//	templates.go  — LOGIN A/B + DTLS-shaped templates + frame builders
+//	templates.go  — protocol constants + LOGIN/DTLS templates + frame builders
 //	client.go     — UDP session, handshake, bootstrap, frame reassembly
 //	producer.go   — wraps the Client into a go2rtc Producer
 package petlibro
@@ -52,14 +51,17 @@ type Packet struct {
 
 // DialOptions configure a Petlibro session.
 type DialOptions struct {
-	UID        string
-	Host       string // "ip" or "ip:32761"
-	Password   string // default "888888" — encoded into the LOGIN template
-	Audio      bool
-	Quality    string // "hd" (default) or "sd"
-	DisableSub bool   // experimental: try to make the camera stop dual-streaming
-	Strict     bool   // drop the entire GOP if any fragment was lost — pristine pixels
-	Verbose    bool
+	UID     string
+	Host    string // "ip" or "ip:32761"
+	Audio   bool
+	Quality string // "hd" (default) or "sd"
+	// Strict, when set, drops every IDR with any fragment loss and
+	// poisons the GOP — pristine pixels at the cost of multi-second
+	// freezes whenever the network drops a packet.  Off by default;
+	// we emit gapped IDRs (with localised macroblock artefacts) and
+	// drop gapped P-frames (to avoid cascading inter-frame errors).
+	Strict  bool
+	Verbose bool
 }
 
 // Client is one LAN session against a Petlibro camera.
@@ -73,15 +75,11 @@ type Client struct {
 	icounter uint16 // inner cmd counter (byte 4..5)
 
 	// in-order reassembly
-	wrap          WrapSeq
+	wrap          wrapSeq
 	avBuffer      map[uint64]*pendingFrag
 	avNextExt     uint64
 	avHighExt     uint64
 	avPrevSubWire uint16
-
-	// per-stream frame accumulation
-	curBuf      []byte
-	curKeyframe bool
 
 	// monotonic counters for outgoing Packets (camera's per-channel
 	// frame_num is independent for main vs sub, so we use our own)
@@ -94,15 +92,13 @@ type Client struct {
 	closeOnce sync.Once
 	closeMu   sync.Mutex
 
-	audio        bool
-	quality      string
-	disableSub   bool
-	strict       bool
-	verbose      bool
-	mainAsm      channelAsm // per-channel assembly state for ch=0x05
-	subAsm       channelAsm // per-channel assembly state for ch=0x07
-	gopPoisoned  bool   // a fragment was lost in this GOP — drop P-frames until next clean IDR
-	lastPFrameTs uint32 // last P-frame's trailer ts (kept for legacy callers)
+	audio       bool
+	quality     string
+	strict      bool
+	verbose     bool
+	mainAsm     channelAsm // per-channel assembly state for ch=0x05
+	subAsm      channelAsm // per-channel assembly state for ch=0x07
+	gopPoisoned bool       // strict mode only: a fragment was lost in this GOP — drop P-frames until next clean IDR
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it
@@ -125,9 +121,9 @@ type Client struct {
 type counters struct {
 	bytesIn      uint64 // bytes read from the UDP socket (encrypted)
 	pktsIn       uint64 // UDP datagrams successfully read
-	mainFrags    uint64 // fragments on channel 0x05 (HD)
-	subFrags     uint64 // fragments on channel 0x07 (SD video)
-	audioFrags   uint64 // fragments on channel 0x03
+	mainFrags    uint64 // fragments on the main video channel (ch=0x05, IDR-bearing)
+	subFrags     uint64 // fragments on the sub video channel (ch=0x07, P-frames)
+	audioFrags   uint64 // fragments on the audio channel (ch=0x03)
 	otherFrags   uint64 // anything else (control, etc.)
 	vidFrags     uint64 // video fragments (ch=0x05 + ch=0x07) reaching emit
 	vidFramesIn  uint64 // distinct frame_num values seen on video channel
@@ -142,9 +138,11 @@ type counters struct {
 }
 
 type pendingFrag struct {
-	channel    byte
-	b1         byte
-	isAudio    bool   // true for either audio variant (channels 0x03 or 0x07/b1=0x0d)
+	channel byte
+	// isAudio: true for either AAC variant — ch=0x03 sub17=0x01 ADTS
+	// at offset 36, or ch=0x07 sub17=0x00 b1=0x0d with an 8-byte
+	// inner header before ADTS sync.
+	isAudio    bool
 	subExt     uint64
 	frameNum   uint32 // camera's per-channel frame counter (inner[28..31])
 	fragIdx    uint16 // index of fragment within frame (inner[22..23])
@@ -158,12 +156,12 @@ type pendingFrag struct {
 // a single shared buffer would constantly drop partial frames whenever
 // the channels switch.
 type channelAsm struct {
-	buf           []byte
-	curFrameNum   uint32
-	curAUTotal    uint16 // inner[20]: total fragments advertised for current frame
+	buf            []byte
+	curFrameNum    uint32
+	curAUTotal     uint16 // inner[20]: total fragments advertised for current frame
 	curAUDataCount uint16
-	curAUGapped   bool
-	expectFragIdx uint16
+	curAUGapped    bool
+	expectFragIdx  uint16
 }
 
 func (a *channelAsm) reset() {
@@ -189,7 +187,7 @@ func Dial(opts DialOptions) (*Client, error) {
 
 	host := opts.Host
 	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(host, fmt.Sprintf("%d", LANPort))
+		host = net.JoinHostPort(host, fmt.Sprintf("%d", lanPort))
 	}
 	cam, err := net.ResolveUDPAddr("udp", host)
 	if err != nil {
@@ -223,17 +221,16 @@ func Dial(opts DialOptions) (*Client, error) {
 		return nil, err
 	}
 	c := &Client{
-		conn:       udp,
-		cam:        cam,
-		uid:        opts.UID,
-		nonce:      nonce,
-		kseq:       2,
-		audio:      opts.Audio,
-		quality:    opts.Quality,
-		disableSub: opts.DisableSub,
-		strict:     opts.Strict,
-		verbose:    opts.Verbose,
-		frames:     make(chan *Packet, 1024),
+		conn:    udp,
+		cam:     cam,
+		uid:     opts.UID,
+		nonce:   nonce,
+		kseq:    2,
+		audio:   opts.Audio,
+		quality: opts.Quality,
+		strict:  opts.Strict,
+		verbose: opts.Verbose,
+		frames:  make(chan *Packet, 1024),
 	}
 	if path := os.Getenv("PETLIBRO_DUMP_VIDEO"); path != "" {
 		if f, ferr := os.Create(path); ferr == nil {
@@ -435,20 +432,15 @@ func (c *Client) bootstrap() error {
 	}
 	cmds := []cmd{
 		{0x1000, stream},
-		{0x7000, ioctlBody12(IOCtrlVendor0372)},
-		{0x7000, ioctlBody12(IOCtrlVendor0322)},
-		{0x7000, ioctlBody12(IOCtrlVendor032A)},
-		{0x7000, ioctlBody12(IOCtrlStart)},
-	}
-	if c.disableSub {
-		// Experimental: try to ask the camera to stop dual-streaming
-		// by sending a separate sub-channel SETSTREAMCTRL.
-		cmds = append([]cmd{{0x1000, disableSubProbe}}, cmds...)
+		{0x7000, ioctlBody12(ioctlVendor0372)},
+		{0x7000, ioctlBody12(ioctlVendor0322)},
+		{0x7000, ioctlBody12(ioctlVendor032A)},
+		{0x7000, ioctlBody12(ioctlStart)},
 	}
 	if c.audio {
 		// The app enables audio AFTER IPCAM_START via a separate
 		// 0x0300 AUDIO_ENABLE; do not also pack it into IPCAM_START.
-		audioOn := ioctlBody12(IOCtrlAudioOn)
+		audioOn := ioctlBody12(ioctlAudioOn)
 		audioOn[4] = 0x01
 		cmds = append(cmds, cmd{0x7000, audioOn})
 	}
@@ -515,12 +507,12 @@ func (c *Client) bootstrap() error {
 
 	c.avPrevSubWire = bootstrapAVMax
 	if bootstrapAVMax == 0x3FFF {
-		c.wrap = WrapSeq{Ext: 0x4000}
+		c.wrap = wrapSeq{ext: 0x4000}
 	} else {
-		c.wrap = WrapSeq{Ext: uint64(bootstrapAVMax) + 1}
+		c.wrap = wrapSeq{ext: uint64(bootstrapAVMax) + 1}
 	}
-	c.avNextExt = c.wrap.Ext
-	c.avHighExt = c.wrap.Ext - 1
+	c.avNextExt = c.wrap.ext
+	c.avHighExt = c.wrap.ext - 1
 	c.avBuffer = make(map[uint64]*pendingFrag)
 	return nil
 }
@@ -734,14 +726,12 @@ func (c *Client) handleIncoming(pkt []byte) {
 	}
 
 	var (
-		isAV    bool
 		isAudio bool
 		payload []byte
 	)
 	switch {
 	case (channel == innerChMain || channel == innerChSub) &&
 		(b1 == 0x00 || b1 == 0x04 || b1 == 0x05):
-		isAV = true
 		payload = sliceWithPaylen(36)
 	case (channel == innerChMain || channel == innerChSub) &&
 		b1 == 0x01 && sub17 == 0x01:
@@ -761,7 +751,6 @@ func (c *Client) handleIncoming(pkt []byte) {
 		//     lost — forcing subsequent frames onto the
 		//     lastEmitTs+1 fallback and producing tiny PTS deltas
 		//     that confuse ffmpeg's reorder buffer.
-		isAV = true
 		payload = sliceWithPaylen(36)
 	case channel == innerChAudio && sub17 == 0x01 &&
 		len(inner) >= 38 && inner[36] == 0xFF && inner[37] == 0xF1:
@@ -771,8 +760,8 @@ func (c *Client) handleIncoming(pkt []byte) {
 	case channel == innerChSub && sub17 == 0x00 && b1 == 0x0d &&
 		len(inner) >= 46 && inner[44] == 0xFF && inner[45] == 0xF1:
 		// Audio variant (a): 8-byte inner header before ADTS sync,
-		// carried on sub_video channel — see PROTOCOL_NOTES.txt.
-		// Strip the 8 header bytes so the producer sees clean ADTS.
+		// carried on the sub_video channel.  Strip the 8 header
+		// bytes so the producer sees clean ADTS.
 		isAudio = true
 		full := sliceWithPaylen(36)
 		if len(full) > 8 {
@@ -783,15 +772,14 @@ func (c *Client) handleIncoming(pkt []byte) {
 	default:
 		return
 	}
-	_ = isAV
-	_ = isAudio
 
-	// (No subWire filter — Python accepts AV/audio packets at any wire
-	// value.  Filtering to >= 0x4000 dropped legitimate audio fragments.)
-	subExt := c.wrap.Extend(subWire)
+	// No filter by subWire — audio fragments legitimately arrive at
+	// wire values < 0x4000 alongside the high AV indices, and dropping
+	// those would silence the audio stream.
+	subExt := c.wrap.extend(subWire)
 	if subExt > c.avHighExt {
 		c.avHighExt = subExt
-		c.wrap.AdvanceTo(subWire)
+		c.wrap.advanceTo(subWire)
 	}
 	if subExt < c.avNextExt {
 		return // late dup
@@ -806,10 +794,10 @@ func (c *Client) handleIncoming(pkt []byte) {
 	}
 	var totalFrags byte
 	if len(inner) >= 21 {
-		totalFrags = inner[20] // PROTOCOL_NOTES: total fragments in this frame
+		totalFrags = inner[20] // camera's reported total fragment count for this frame
 	}
 	c.avBuffer[subExt] = &pendingFrag{
-		channel: channel, b1: b1, isAudio: isAudio,
+		channel: channel, isAudio: isAudio,
 		subExt: subExt, frameNum: frameNum, fragIdx: fragIdx,
 		totalFrags: totalFrags, payload: payload,
 	}
@@ -861,25 +849,31 @@ func (c *Client) forceDrain() {
 	}
 }
 
-// emit handles one in-order entry.  Frame structure on the wire:
+// emit handles one in-order, fully-classified fragment.  Video frame
+// structure on the wire:
 //
-//   * 0..N-1 "data" fragments containing slice bytes, paylen=1024 each
-//     (except possibly the last one); no trailer.
-//   * 1 final "end" fragment with a smaller paylen, ending in the
-//     16-byte metadata block (codec_id 0x4e + 15-byte ms-ts trailer).
+//   - 0..N-1 "data" fragments with b1 in {0x00, 0x04, 0x05}.  Slice
+//     bytes; paylen=1024 except possibly the last one; no trailer.
+//   - 1 final "end" fragment with b1=0x01 sub17=0x01, paylen smaller
+//     than 1024, ending in a 16-byte metadata trailer
+//     (codec_id 0x4e + 4-byte variant prefix + 7 zero bytes + 4-byte
+//     ms-ts).  The trailer's stream-id byte tells us whether this
+//     frame is HD (0x01) or SD (0x02).
 //
 // The end fragment is identified by the trailer signature on its
 // payload tail, NOT by fragIdx (which can wrap when N>16 and reuse
-// "16" both as a data index and the end marker).  inner[20] gives the
-// total fragment count, so loss of the trailing data fragment — which
-// fragIdx gaps cannot see — is also detectable.
+// "16" both as a data-fragment index and the end marker).  inner[20]
+// gives the camera's reported total fragment count, used as a
+// secondary sanity check for end-fragment detection and as the basis
+// for the "all data fragments lost" hard-floor in the end-fragment
+// path.
 //
 // CRITICAL: the camera time-multiplexes IDR fragments on ch=0x05 with
 // P-frame fragments on ch=0x07 in WIRE ORDER — e.g. mid-IDR a P-frame
 // can arrive.  Each channel MUST have its own assembly buffer or the
 // constant frame_num switching would drop every partial IDR.  Both
 // channels' completed frames are emitted into one PTS-ordered output
-// stream though, since they share the camera's frame_num counter.
+// stream, since they share the camera's frame_num counter.
 func (c *Client) emit(e *pendingFrag) {
 	if c.startedAt.IsZero() {
 		c.startedAt = time.Now()
@@ -900,83 +894,35 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.stats.vidFrags++
 
-	// Camera concurrently sends two video streams (HD = stream_id 0x01,
-	// SD = stream_id 0x02) over ch=0x05 (IDR data) + ch=0x07 (P-frames).
-	// They interleave in wire order; if we don't filter one out the
-	// downstream decoder gets a mix and renders the wrong-resolution
-	// frames with scattered MB-level decoder errors.
-	//
-	// Filter strategy:
-	//
-	// * ch=0x05 IDR fragments don't carry a per-fragment stream id
-	//   (only the end-fragment's trailer does).  Use inner[20]
-	//   (total fragment count) as a size-based discriminator:
-	//   ~12-16 frags = SD, ~70-78 frags = HD.  Threshold = 30.
-	//
-	// * ch=0x07 P-frames are single-fragment with a trailer; check
-	//   the trailer's stream id byte directly.
-	wantStreamID := byte(0x01) // HD = main stream by default
+	// Stream selection.  The camera can be configured (via its
+	// Petlibro cloud settings; sticky per-camera) to send either HD
+	// only, SD only, or both streams in parallel.  When both are
+	// active, IDR fragments from each stream share ch=0x05 and
+	// P-frame fragments share ch=0x07, with the only reliable
+	// discriminator being the trailer stream-id byte on each frame's
+	// end-fragment (p[-12]: 0x01 = HD main, 0x02 = SD sub).  Data
+	// fragments (b1=0x00/0x04/0x05) carry no per-fragment stream-id,
+	// so we accumulate them optimistically and discard the buffer
+	// later if the end-fragment reveals the wrong stream.
+	wantStreamID := byte(0x01) // HD by default
 	if c.quality == "sd" {
-		wantStreamID = 0x02 // SD = sub stream
+		wantStreamID = 0x02
 	}
-	// (no totalFrags-based HD/SD filter on ch=0x05 anymore — the
-	// fragment-count discriminator (>=30 = HD) only worked while the
-	// camera was running in dual-stream mode where HD IDRs were ~78
-	// fragments and parallel SD IDRs were ~12.  In HD-only mode, HD
-	// IDRs drop to ~9 fragments and the >=30 threshold filters them
-	// all out, leaving the stream stuck.  When dual-stream mode IS
-	// active, the SD end-fragment's trailer stream-id discriminator
-	// at the in-emit() end-fragment path still handles it.)
-	// ch=0x07 P-frame: filter by trailer stream-id byte.  The camera
-	// dual-streams regardless of SETSTREAMCTRL — feeding HD-encoded
-	// P-frames into an SD decoder produces top-row mb_type / cbp
-	// errors and is semantically wrong (the consumer asked for a
-	// 360p stream).  Accept only the matching stream.
-	//
-	// Trailer byte layout for ch=0x07 P-frames (single fragment):
-	//   p[-16] = 0x4e codec_id
-	//   p[-15] = 0x00
-	//   p[-14] = 0x00 (P-frame; 0x01 for IDR — not seen on ch=0x07)
-	//   p[-13] = 0x00
-	//   p[-12] = stream-id (0x01 HD / 0x02 SD)
-	//
-	// Note: SD P-frames are rare on this firmware (~10% of ch=0x07
-	// traffic), so SD playback is closer to a slideshow than 25 fps
-	// video.  That's a camera-side encoding choice — the camera only
-	// emits an SD P-frame when there's actual motion to encode.
+
+	// ch=0x07 single-fragment P-frames with a trailer can be
+	// discriminated on arrival — drop wrong-stream ones immediately.
+	// We deliberately DON'T also flush the pending ch=0x05 IDR here
+	// (an earlier version did, and that truncated the IDR at its
+	// last fragments when a wrong-stream P-frame arrived between
+	// HD IDR fragments — visible in mpv as "corrupted macroblock
+	// X 66 / X 67" errors on every frame).  Multi-fragment P-frames
+	// (b1=0x00 data + b1=0x01 sub17=0x01 end) reach the in-emit()
+	// end-fragment path below instead and are filtered there.
 	if e.channel == innerChSub && len(e.payload) >= 16 &&
 		e.payload[len(e.payload)-16] == CodecH264 &&
 		e.payload[len(e.payload)-12] != wantStreamID {
-		// Filter out the wrong-stream P-frame and DO NOT use it
-		// to flush the pending main-stream IDR.  When the camera
-		// dual-streams, a wrong-stream ch=0x07 P-frame can arrive
-		// on the wire BETWEEN two of our stream's IDR fragments
-		// (e.g. between frag 73 and frag 75).  Flushing here
-		// truncated the IDR at its last 1–2 fragments which carry
-		// the bottom MB rows, producing the "corrupted macroblock
-		// X 66 / X 67" pattern in mpv on every frame.
-		//
-		// The matching-stream ch=0x07 branch below still flushes,
-		// and the camera sends those at full frame rate (~15-25
-		// fps), so the IDR sits at most one P-frame interval
-		// (~40-66 ms) longer than before.  Worst-case fallback:
-		// the next IDR's first ch=0x05 fragment flushes via the
-		// new-frame-num check immediately below.
 		return
 	}
-
-	// This firmware variant:
-	//   ch=0x05 IDR fragments arrive WITHOUT a trailer-bearing end
-	//     fragment.  All ~16 (small) or ~75 (big) data fragments come
-	//     in order, then the next thing on the wire is a ch=0x07
-	//     P-frame.  The arrival of a ch=0x07 fragment signals that
-	//     the preceding ch=0x05 IDR is complete.
-	//   ch=0x07 P-frames are single-fragment, each with a trailer.
-	//
-	// Older firmware (PCAPdroid pcap) DID put an end fragment with
-	// trailer on ch=0x05 IDRs.  The code handles both: detect end via
-	// trailer signature if present, otherwise flush the IDR on the
-	// next ch=0x07 arrival.
 
 	stripped, frameTs, trailerStreamID, hasTrailer := stripFragmentMetadataTrailer(e.payload)
 	if c.dumpFile != nil {
@@ -992,14 +938,14 @@ func (c *Client) emit(e *pendingFrag) {
 		asm = &c.subAsm
 	}
 
-	// Frame_num change on THIS channel without a clean end fragment.
-	// For ch=0x05 this is back-to-back IDRs (the previous IDR's
-	// end-fragment was lost AND no ch=0x07 P-frame came in between).
-	// Treat it the same as a cross-channel flush — try to emit the
-	// previous IDR rather than silently drop it.  This matters most
-	// when filtering ch=0x07 (e.g. quality=sd where every HD P-frame
-	// is filtered out), since cross-channel flush would otherwise
-	// never fire.
+	// Frame_num change on THIS channel without having seen the
+	// previous frame's end-fragment.  For ch=0x05 this is normally a
+	// back-to-back IDR where the previous IDR's end-fragment was lost
+	// AND the cross-channel ch=0x07 flush below didn't fire — try to
+	// emit the partial previous IDR via flushMainIDR rather than
+	// silently drop it (it might still be decodable with localised
+	// artefacts).  For ch=0x07 it means a P-frame was abandoned mid-
+	// assembly; just reset and count it as a drop.
 	if asm.curFrameNum != 0 && e.frameNum != asm.curFrameNum && len(asm.buf) > 0 {
 		if e.channel == innerChMain {
 			c.flushMainIDR(0)
@@ -1139,9 +1085,6 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	c.pendingFrameTs = frameTs
 	c.havePendingTs = true
-	if !wasMain {
-		c.lastPFrameTs = frameTs
-	}
 	// In strict mode only, drop P-frames in a poisoned GOP until the
 	// next clean IDR.  In non-strict (default), let them through.
 	if c.strict && c.gopPoisoned && !wasMain {
@@ -1151,19 +1094,19 @@ func (c *Client) emit(e *pendingFrag) {
 	c.emitAU(au)
 }
 
-// flushMainIDR emits the accumulated ch=0x05 IDR buffer when a
-// ch=0x07 P-frame arrives without us having seen the IDR's
-// end-fragment.  The IDR's last ~300 bytes (the bottom MB rows on
-// HD) are in that end-fragment, so the slice we have is truncated.
+// flushMainIDR emits the accumulated ch=0x05 IDR buffer in the
+// fallback case where we never received its b1=0x01 sub17=0x01
+// end-fragment — either it was lost on the wire, or this camera
+// firmware variant doesn't send one and we noticed an unrelated
+// cross-channel signal (a ch=0x07 P-frame arrival, or a new ch=0x05
+// frame_num) telling us the IDR is "as complete as it'll get".  The
+// missing end-fragment carries the slice's bottom MB rows plus the
+// rbsp_trailing_bits stop byte, so the AU we have is truncated; the
+// decoder will show macroblock artefacts in the bottom strip.
 //
-// Behaviour mirrors pkg/tutk's handleVideo discipline:
-//   * if a MID-frame fragment was lost (fragIdx gap) — DROP, because
-//     the slice has a hole somewhere in the middle and decoder errors
-//     scatter across the whole frame
-//   * if only the trailing end-fragment was lost (no mid gaps) —
-//     emit in non-strict mode, drop in strict mode.  ffmpeg tolerates
-//     a slice truncated at the very end with minor MB row 66-67
-//     artifacts; the alternative is a multi-second video gap.
+// Strict mode (?strict=1) drops the truncated IDR and poisons the
+// GOP — pristine pixels at the cost of a multi-second freeze until
+// the next clean IDR.  Non-strict mode (default) emits it anyway.
 func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	if len(c.mainAsm.buf) == 0 {
 		c.mainAsm.reset()
@@ -1266,7 +1209,6 @@ func (c *Client) emitAU(au []byte) {
 	c.stats.vidFramesOut++
 }
 
-
 // stripFragmentMetadataTrailer removes the 16-byte per-frame metadata
 // block the Petlibro firmware appends to the LAST video fragment of
 // each frame.  The block is `<codec_id 1B> <variant prefix 4B>
@@ -1282,9 +1224,10 @@ func (c *Client) emitAU(au []byte) {
 //	0x01 = main stream (HD on this camera, 1920x1080)
 //	0x02 = sub stream  (SD on this camera, 640x360)
 //
-// The camera concurrently sends BOTH streams; the configured Quality
-// option picks which one to keep — see streamIDFromTrailer() and the
-// filter at the top of emit().
+// When the camera is in dual-stream mode it sends BOTH streams on
+// the same channels and the configured Quality option picks which
+// one to keep — see the wantStreamID filter at the top of emit() and
+// the end-fragment trailerStreamID discriminator further down.
 //
 // Stripping only 15 trailer bytes would leave the 0x4e codec_id in
 // the slice tail; decoders read it as a stray NAL-14 prefix and bail
@@ -1293,7 +1236,8 @@ func (c *Client) emitAU(au []byte) {
 //
 // Callers should only invoke this on the frame's end fragment (whose
 // tail unambiguously matches the signature) — in mid-frame fragments
-// a coincidental match could shear real slice bytes.
+// a coincidental match could shear real slice bytes.  84 fixed bits
+// of signature put coincidental matches in the 1-in-2^84 zone.
 func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, streamID byte, hasTs bool) {
 	if len(p) < 16 {
 		return p, 0, 0, false
@@ -1385,28 +1329,28 @@ func (c *Client) SetDeadline(t time.Time) error {
 	return c.conn.SetReadDeadline(t)
 }
 
-// WrapSeq tracks a monotonic 64-bit counter that follows a 16-bit wire
-// counter through wrap-arounds.  Single-step jumps >0x8000 are treated
-// as wraps.  Public so producer.go can inspect/test.
-type WrapSeq struct {
-	Ext uint64
+// wrapSeq tracks a monotonic 64-bit counter that follows a 16-bit
+// wire counter through wrap-arounds.  Single-step jumps >0x8000 are
+// treated as wraps.
+type wrapSeq struct {
+	ext uint64
 }
 
-func (w *WrapSeq) Extend(wire uint16) uint64 {
-	lastWire := uint16(w.Ext)
+func (w *wrapSeq) extend(wire uint16) uint64 {
+	lastWire := uint16(w.ext)
 	fwd := (wire - lastWire) & 0xFFFF
 	if fwd < 0x8000 {
-		return w.Ext + uint64(fwd)
+		return w.ext + uint64(fwd)
 	}
 	back := uint64((lastWire - wire) & 0xFFFF)
-	if back > w.Ext {
+	if back > w.ext {
 		return 0
 	}
-	return w.Ext - back
+	return w.ext - back
 }
 
-func (w *WrapSeq) AdvanceTo(wire uint16) {
-	if newExt := w.Extend(wire); newExt > w.Ext {
-		w.Ext = newExt
+func (w *wrapSeq) advanceTo(wire uint16) {
+	if newExt := w.extend(wire); newExt > w.ext {
+		w.ext = newExt
 	}
 }

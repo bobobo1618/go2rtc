@@ -32,7 +32,14 @@ type Producer struct {
 //
 // URL shape:
 //
-//	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&verbose=1]
+//	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
+//
+// `strict=1` switches to a pristine-pixels-over-fluency policy:
+// any IDR with a lost fragment is dropped (instead of emitted with
+// localised macroblock artefacts) and the rest of the GOP is
+// suppressed until the next clean IDR.  Useful when downstream
+// decoder errors are louder than the multi-second freezes strict
+// mode causes on lossy networks.
 func NewProducer(rawURL string) (*Producer, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -41,13 +48,12 @@ func NewProducer(rawURL string) (*Producer, error) {
 	q := u.Query()
 
 	opts := DialOptions{
-		UID:        q.Get("uid"),
-		Host:       u.Host,
-		Audio:      q.Get("audio") == "true" || q.Get("audio") == "1",
-		Quality:    q.Get("quality"),
-		DisableSub: q.Get("disable_sub") == "true" || q.Get("disable_sub") == "1",
-		Strict:     q.Get("strict") == "true" || q.Get("strict") == "1",
-		Verbose:    q.Get("verbose") == "true" || q.Get("verbose") == "1",
+		UID:     q.Get("uid"),
+		Host:    u.Host,
+		Audio:   q.Get("audio") == "true" || q.Get("audio") == "1",
+		Quality: q.Get("quality"),
+		Strict:  q.Get("strict") == "true" || q.Get("strict") == "1",
+		Verbose: q.Get("verbose") == "true" || q.Get("verbose") == "1",
 	}
 	if opts.UID == "" {
 		return nil, fmt.Errorf("petlibro: uid query parameter required")
@@ -150,11 +156,11 @@ func (p *Producer) Start() error {
 		case CodecAACADTS:
 			name = core.CodecAAC
 			payload := pkt.Payload
-			if aac.IsADTS(payload) && len(payload) >= 6 {
+			if aac.IsADTS(payload) {
 				// The camera occasionally appends padding bytes after the
 				// real AAC frame; trim to the ADTS-declared length so the
 				// RTP packetizer doesn't claim a too-large AU.
-				frameLen := int(payload[3]&0x03)<<11 | int(payload[4])<<3 | int(payload[5])>>5
+				frameLen := int(aac.ReadADTSSize(payload))
 				if frameLen > aac.ADTSHeaderLen(payload) && frameLen <= len(payload) {
 					payload = payload[:frameLen]
 				}
@@ -196,21 +202,6 @@ func containsAVCCNALType(avcc []byte, want byte) bool {
 	return false
 }
 
-// adtsParams returns (sampleRate, channels) from an ADTS-framed AAC
-// header.  Returns (0, 0) if the header isn't valid ADTS.
-func adtsParams(b []byte) (int, int) {
-	if !aac.IsADTS(b) {
-		return 0, 0
-	}
-	sampleRates := []int{96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350}
-	sampleRateIdx := (b[2] >> 2) & 0x0F
-	if int(sampleRateIdx) >= len(sampleRates) {
-		return 0, 0
-	}
-	ch := (b[2]&0x01)<<2 | (b[3]>>6)&0x03
-	return sampleRates[sampleRateIdx], int(ch)
-}
-
 // probe reads frames until we have a video codec (with parameter sets)
 // and, if audio was requested, an audio codec.  Returns the SPS-bearing
 // IDR's full Annex-B AU so the producer can replay it as the first
@@ -248,13 +239,11 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
 				}
 			}
 		case CodecAACADTS:
-			if acodec == nil && aac.IsADTS(pkt.Payload) {
-				// Derive sample rate / channels from ADTS to build the
-				// AudioSpecificConfig that the RTP layer needs.
-				sr, ch := adtsParams(pkt.Payload)
-				if sr > 0 && ch > 0 {
-					cfg := aac.EncodeConfig(aac.TypeAACLC, uint32(sr), byte(ch), false)
-					acodec = aac.ConfigToCodec(cfg)
+			if acodec == nil {
+				// aac.ADTSToCodec validates the header and fills in
+				// sample rate / channels / AudioSpecificConfig for us.
+				if c := aac.ADTSToCodec(pkt.Payload); c != nil {
+					acodec = c
 				}
 			}
 		}

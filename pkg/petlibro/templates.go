@@ -5,11 +5,13 @@ import (
 	"encoding/hex"
 )
 
-// Petlibro / Kalay LAN protocol constants.
-// PROTOCOL_NOTES.txt in the project root has the full byte-level docs.
+// Petlibro / Kalay LAN protocol constants.  Byte layouts are
+// summarised in the per-builder comments below; field semantics
+// were reverse-engineered from PCAPdroid captures of the official
+// Petlibro Android app against PLAF103/PLAF203 cameras.
 
 const (
-	LANPort = 32761
+	lanPort = 32761
 
 	// Outer Kalay header (28 bytes) - byte 2 is the protocol version
 	// (0x1D for Petlibro firmware vs 0x19 for Wyze).
@@ -34,26 +36,35 @@ const (
 // offset 0x34/0x30 — matches what the Petlibro Android app sends.
 var sdkVersion = []byte{0x00, 0x08, 0x03, 0x04}
 
-// IOCtrl IDs (from PROTOCOL_NOTES — verified live).
+// IOCtrl IDs used during the bootstrap sequence (verified against
+// PCAPdroid captures of the official Petlibro Android app).  The
+// 0x03xx "vendor" IDs are camera-specific queries the app sends
+// before starting the stream — names reflect their app-side purpose:
+//   - 0x0322 GET_AUDIO_OUT_FORMAT
+//   - 0x032A GET_FORMAT
+//   - 0x0372 unknown vendor query
+//
+// Removing them from the bootstrap doesn't prevent the stream from
+// starting, but matching the app's sequence avoids edge-case
+// firmware quirks on some camera models.
 const (
-	IOCtrlSetStreamCtrl uint32 = 0x0024
-	IOCtrlVendor0322    uint32 = 0x0322
-	IOCtrlVendor032A    uint32 = 0x032A
-	IOCtrlVendor0372    uint32 = 0x0372
-	IOCtrlStart         uint32 = 0x01FF
-	IOCtrlStop          uint32 = 0x02FF
-	IOCtrlAudioOn       uint32 = 0x0300
-	IOCtrlAudioOff      uint32 = 0x0301
+	ioctlVendor0322 uint32 = 0x0322
+	ioctlVendor032A uint32 = 0x032A
+	ioctlVendor0372 uint32 = 0x0372
+	ioctlStart      uint32 = 0x01FF // IPCAM_START
+	ioctlAudioOn    uint32 = 0x0300 // AUDIO_ENABLE
 )
 
-// SETSTREAMCTRL bodies (12 bytes) — chan + type + padding.
+// SETSTREAMCTRL bodies (12 bytes) — IOCtrl 0x0024 wire payload.
+// Byte 4 selects which stream the body configures (0x01 = main /
+// HD, 0x02 = sub / SD); bytes 6..7 are a feature-flag bitmask.
+// Sending qualityHD enables HD; sending qualitySD enables SD.  The
+// camera will continue emitting whichever stream(s) it was last
+// told to enable; the HD/SD on/off state is sticky in the camera's
+// cloud config (set via the Petlibro app), not toggled per-session.
 var (
 	qualityHD = []byte{0x24, 0, 0, 0, 0x01, 0x00, 0xff, 0x3f, 0, 0, 0, 0}
 	qualitySD = []byte{0x24, 0, 0, 0, 0x02, 0x00, 0x8a, 0x81, 0, 0, 0, 0}
-	// Experimental: SETSTREAMCTRL chan=2 type=0 — probe to see whether
-	// the camera will treat this as "disable sub stream".  Not documented;
-	// applied opportunistically when ?disable_sub=1 is set in the URL.
-	disableSubProbe = []byte{0x24, 0, 0, 0, 0x02, 0x00, 0x00, 0x00, 0, 0, 0, 0}
 )
 
 // Inner-cmd "channel" markers at offset 16..17.
