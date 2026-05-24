@@ -919,13 +919,14 @@ func (c *Client) emit(e *pendingFrag) {
 	if c.quality == "sd" {
 		wantStreamID = 0x02 // SD = sub stream
 	}
-	if e.channel == innerChMain && e.totalFrags > 0 {
-		isBigIDR := e.totalFrags >= 30
-		wantBig := wantStreamID == 0x01
-		if isBigIDR != wantBig {
-			return
-		}
-	}
+	// (no totalFrags-based HD/SD filter on ch=0x05 anymore — the
+	// fragment-count discriminator (>=30 = HD) only worked while the
+	// camera was running in dual-stream mode where HD IDRs were ~78
+	// fragments and parallel SD IDRs were ~12.  In HD-only mode, HD
+	// IDRs drop to ~9 fragments and the >=30 threshold filters them
+	// all out, leaving the stream stuck.  When dual-stream mode IS
+	// active, the SD end-fragment's trailer stream-id discriminator
+	// at the in-emit() end-fragment path still handles it.)
 	// ch=0x07 P-frame: filter by trailer stream-id byte.  The camera
 	// dual-streams regardless of SETSTREAMCTRL — feeding HD-encoded
 	// P-frames into an SD decoder produces top-row mb_type / cbp
