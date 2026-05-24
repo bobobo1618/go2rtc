@@ -137,6 +137,8 @@ type counters struct {
 	fragsLost    uint64 // total fragments lost (sum of frag_idx gap sizes)
 	forceDrains  uint64 // times forceDrain ran with buffered packets to flush
 	recvTimeouts uint64 // SetReadDeadline-triggered timeouts (no UDP data)
+	readerDrops  uint64 // raw UDP packets dropped because the processor queue was full
+	emitDrops    uint64 // assembled AUs dropped because the consumer queue was full
 }
 
 type pendingFrag struct {
@@ -231,7 +233,7 @@ func Dial(opts DialOptions) (*Client, error) {
 		disableSub: opts.DisableSub,
 		strict:     opts.Strict,
 		verbose:    opts.Verbose,
-		frames:     make(chan *Packet, 256),
+		frames:     make(chan *Packet, 1024),
 	}
 	if path := os.Getenv("PETLIBRO_DUMP_VIDEO"); path != "" {
 		if f, ferr := os.Create(path); ferr == nil {
@@ -499,12 +501,12 @@ func (c *Client) bootstrap() error {
 func (c *Client) recvLoop() {
 	defer c.Close()
 
-	rawChan := make(chan []byte, 1024) // ~1 MiB at peak packet sizes
+	rawChan := make(chan []byte, 4096) // ~4 MiB at peak packet sizes
 	go c.readerGoroutine(rawChan)
 
 	lastForce := time.Now()
 	lastStats := time.Now()
-	tick := time.NewTicker(50 * time.Millisecond)
+	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
 
 	for {
@@ -527,7 +529,11 @@ func (c *Client) recvLoop() {
 			// fall through to periodic work below
 		}
 
-		if time.Since(lastForce) > 500*time.Millisecond {
+		// Shorter forceDrain interval — the camera (over LAN) has
+		// usually retransmitted lost packets within ~50-100 ms or
+		// they're not coming at all.  Holding longer just adds
+		// rendering latency without recovering more data.
+		if time.Since(lastForce) > 100*time.Millisecond {
 			c.forceDrain()
 			lastForce = time.Now()
 		}
@@ -571,7 +577,7 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 			// one rather than block the reader and let the kernel
 			// drop instead — the inner cmd counter / frag_idx gap
 			// detection will mark the resulting AU as incomplete.
-			c.stats.recvTimeouts++
+			c.stats.readerDrops++
 		}
 	}
 }
@@ -598,13 +604,16 @@ func (c *Client) dumpStats() {
 			fragsLost:    s.fragsLost - c.prevStats.fragsLost,
 			forceDrains:  s.forceDrains - c.prevStats.forceDrains,
 			recvTimeouts: s.recvTimeouts - c.prevStats.recvTimeouts,
+			readerDrops:  s.readerDrops - c.prevStats.readerDrops,
+			emitDrops:    s.emitDrops - c.prevStats.emitDrops,
 		}
 	}
-	fmt.Printf("[petlibro/stats] in=%d pkts (%d KiB) channels: main=%d sub=%d audio=%d other=%d | video: %d frames in -> %d out (drop %d) | frag skips: %d (%d frags lost) | forceDrain: %d\n",
+	fmt.Printf("[petlibro/stats] in=%d pkts (%d KiB) channels: main=%d sub=%d audio=%d other=%d | video: %d frames in -> %d out (drop %d) | frag skips: %d (%d frags lost) | forceDrain: %d | qDrops reader=%d emit=%d\n",
 		delta.pktsIn, delta.bytesIn/1024,
 		delta.mainFrags, delta.subFrags, delta.audioFrags, delta.otherFrags,
 		delta.vidFramesIn, delta.vidFramesOut, delta.vidDropped,
-		delta.fragSkips, delta.fragsLost, delta.forceDrains)
+		delta.fragSkips, delta.fragsLost, delta.forceDrains,
+		delta.readerDrops, delta.emitDrops)
 	c.prevStats = *s
 }
 
@@ -1003,16 +1012,19 @@ func (c *Client) emit(e *pendingFrag) {
 	asm.curFrameNum = 0
 
 	if gapped {
-		// Strict mode: drop the entire GOP.  Non-strict: just drop
-		// the corrupted frame and let the next P-frames flow — the
-		// decoder will conceal motion vectors against the previous
-		// good IDR until the next clean IDR.  This trades pristine
-		// pixels for fluent playback when the wire is lossy.
+		// Strict mode: drop the entire GOP for pristine pixels.
+		// Non-strict mode (default): emit the partial frame anyway.
+		// Even a slice with a mid-frame hole gives the H.264 decoder
+		// SOMETHING to reference for the next ~50 P-frames, and any
+		// visual artefacts at the hole location are far less
+		// disruptive than the multi-second freeze that results from
+		// the decoder waiting for the next clean IDR.
 		if c.strict {
 			c.gopPoisoned = true
+			c.stats.vidDropped++
+			return
 		}
-		c.stats.vidDropped++
-		return
+		c.stats.vidDropped++ // still counted as "would-have-dropped"
 	}
 	c.pendingFrameTs = frameTs
 	c.havePendingTs = true
@@ -1057,14 +1069,22 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
-	if midGapped || c.strict {
-		// Mid-frame fragment loss means the slice has a hole in the
-		// middle — decoder can't conceal that cleanly, produces
-		// cascading errors that contaminate every later P-frame in
-		// the GOP via inter-frame prediction.  Drop the IDR.
+	if c.strict && (midGapped || tailMissing) {
+		// Strict mode: drop the IDR if anything was lost — pristine
+		// pixels over fluency.  Cascading inter-frame errors are
+		// avoided by also poisoning the GOP so subsequent P-frames
+		// are dropped until the next clean IDR.
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
+	}
+	if midGapped {
+		// Non-strict: emit the partial IDR anyway.  ffmpeg will show
+		// macroblock artefacts at the gap location for ~50 P-frames
+		// until the next clean IDR arrives — visibly noisy but vastly
+		// better than the multi-second video freeze that dropping the
+		// IDR would produce.
+		c.stats.vidDropped++
 	}
 	_ = tailMissing
 	if nextPFrameTs != 0 {
@@ -1217,6 +1237,7 @@ func (c *Client) queuePacket(p *Packet) {
 	select {
 	case c.frames <- p:
 	default:
+		c.stats.emitDrops++
 	}
 }
 

@@ -15,6 +15,14 @@ import (
 type Producer struct {
 	core.Connection
 	client *Client
+
+	// firstAU holds the SPS-bearing IDR access unit that probe()
+	// consumed to derive the H.264 codec parameters.  Start() replays
+	// it as the first emitted frame so consumers don't have to wait
+	// up to a full GOP for the next IDR.  Annex-B encoded.
+	firstAU []byte
+	firstTS uint32
+	firstFN uint32
 }
 
 // NewProducer parses a petlibro:// URL, dials the camera, probes the
@@ -49,7 +57,7 @@ func NewProducer(rawURL string) (*Producer, error) {
 		return nil, err
 	}
 
-	medias, err := probe(client)
+	medias, firstAU, firstTS, firstFN, err := probe(client)
 	if err != nil {
 		_ = client.Close()
 		return nil, err
@@ -65,16 +73,46 @@ func NewProducer(rawURL string) (*Producer, error) {
 			Medias:     medias,
 			Transport:  client,
 		},
-		client: client,
+		client:  client,
+		firstAU: firstAU,
+		firstTS: firstTS,
+		firstFN: firstFN,
 	}, nil
 }
 
 func (p *Producer) Start() error {
-	// probe() ate the first IDR for its SPS; forwarding P-frames
-	// before another IDR arrives makes the downstream decoder
-	// reference a frame it never saw.  Hold H.264 until the first
-	// IsKeyframe=true packet, then start forwarding.
+	// probe() saved the SPS-bearing IDR.  Replay it as the first frame
+	// so the downstream decoder gets a valid GOP head immediately and
+	// doesn't have to wait up to a full GOP (~1-2 s) for the next IDR
+	// from the camera.  Any P-frames already buffered behind probe's
+	// IDR will reference that very IDR — they're now valid too.
 	keyframeSeen := false
+	if p.firstAU != nil {
+		avcc := annexb.EncodeToAVCC(p.firstAU)
+		if len(avcc) >= 5 {
+			for _, recv := range p.Receivers {
+				if recv.Codec.Name == core.CodecH264 {
+					// Version=0 (default) is the AVCC-payload
+					// sentinel that pkg/h264.RTPPay reads as "fragment
+					// me into RTP packets".  Setting Version=2 here
+					// would make RTPPay pass our AVCC payload through
+					// as if already RTP-packetised — decoders would
+					// then see an AVCC length header as a NAL byte and
+					// produce only noise.
+					recv.WriteRTP(&core.Packet{
+						Header: rtp.Header{
+							SequenceNumber: uint16(p.firstFN),
+							Timestamp:      p.firstTS,
+						},
+						Payload: avcc,
+					})
+					break
+				}
+			}
+		}
+		keyframeSeen = true
+	}
+
 	for {
 		_ = p.client.SetDeadline(time.Now().Add(core.ConnDeadline))
 		pkt, err := p.client.ReadPacket()
@@ -155,15 +193,19 @@ func adtsParams(b []byte) (int, int) {
 }
 
 // probe reads frames until we have a video codec (with parameter sets)
-// and, if audio was requested, an audio codec.
-func probe(client *Client) ([]*core.Media, error) {
+// and, if audio was requested, an audio codec.  Returns the SPS-bearing
+// IDR's full Annex-B AU so the producer can replay it as the first
+// emitted frame, saving consumers up to one full GOP of wait time.
+func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
 	_ = client.SetDeadline(time.Now().Add(core.ProbeTimeout))
 
 	var vcodec, acodec *core.Codec
+	var firstAU []byte
+	var firstTS, firstFN uint32
 	for {
 		pkt, err := client.ReadPacket()
 		if err != nil {
-			return nil, fmt.Errorf("petlibro: probe: %w", err)
+			return nil, nil, 0, 0, fmt.Errorf("petlibro: probe: %w", err)
 		}
 		if pkt == nil || len(pkt.Payload) < 5 {
 			continue
@@ -175,6 +217,11 @@ func probe(client *Client) ([]*core.Media, error) {
 				buf := annexb.EncodeToAVCC(pkt.Payload)
 				if len(buf) >= 5 && h264.NALUType(buf) == h264.NALUTypeSPS {
 					vcodec = h264.AVCCToCodec(buf)
+					// Petlibro packs SPS+PPS+IDR into one AU; keep the
+					// Annex-B form so Start() can re-emit it verbatim.
+					firstAU = append([]byte(nil), pkt.Payload...)
+					firstTS = pkt.Timestamp
+					firstFN = pkt.FrameNo
 				}
 			}
 		case CodecAACADTS:
@@ -210,5 +257,5 @@ func probe(client *Client) ([]*core.Media, error) {
 			Codecs:    []*core.Codec{acodec},
 		})
 	}
-	return medias, nil
+	return medias, firstAU, firstTS, firstFN, nil
 }
