@@ -710,23 +710,24 @@ func (c *Client) handleIncoming(pkt []byte) {
 		(b1 == 0x00 || b1 == 0x04 || b1 == 0x05):
 		isAV = true
 		payload = sliceWithPaylen(36)
-	case channel == innerChMain && b1 == 0x01 && sub17 == 0x01:
-		// IDR END-FRAGMENT on the main channel.  Verified on PLAF203
-		// firmware: a 78-fragment HD IDR is 77 data fragments
-		// (b1=0x00/0x04, paylen=1024) followed by ONE b1=0x01
-		// sub17=0x01 fragment (paylen ~288, ends with the trailer
-		// signature 4e 00 01 00 <stream_id> 00*7 <ts>).  That last
-		// fragment carries the bottom MB rows of the slice plus
-		// the rbsp_trailing_bits stop byte — without it ffmpeg
-		// errors on rows 66-67 of every IDR.
-		//
-		// CAREFUL: do NOT extend this to ch=0x07.  There the camera
-		// uses b1=0x01 fragments as the END of 2-fragment P-frames
-		// (tf=2, sub17=0x01) too, but accepting those scrambled the
-		// P-frame assembly and produced widespread mb_type / cbp /
-		// intra-prediction errors across the whole frame.  P-frame
-		// multi-fragment handling needs separate analysis before we
-		// can turn it on safely.
+	case (channel == innerChMain || channel == innerChSub) &&
+		b1 == 0x01 && sub17 == 0x01:
+		// END-FRAGMENT of a multi-fragment AV frame.
+		//   * On ch=0x05: closes a multi-fragment IDR.  Verified on
+		//     PLAF203 firmware — a 78-fragment HD IDR is 77 data
+		//     fragments (b1=0x00/0x04, paylen=1024) followed by ONE
+		//     b1=0x01 sub17=0x01 fragment (paylen ~288, ends with
+		//     the trailer signature 4e 00 01 00 <stream_id> 00*7
+		//     <ts>).  That last fragment carries the bottom MB rows
+		//     plus rbsp_trailing_bits — without it the decoder
+		//     errors on rows 66-67 of every IDR.
+		//   * On ch=0x07: closes a 2-fragment P-frame (tf=2, with
+		//     a b1=0x00 data fragment of paylen=1024 + this b1=0x01
+		//     end fragment).  Without it, multi-fragment P-frames
+		//     never emit AND their trailer-borne ms timestamp is
+		//     lost — forcing subsequent frames onto the
+		//     lastEmitTs+1 fallback and producing tiny PTS deltas
+		//     that confuse ffmpeg's reorder buffer.
 		isAV = true
 		payload = sliceWithPaylen(36)
 	case channel == innerChAudio && sub17 == 0x01 &&
