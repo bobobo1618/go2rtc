@@ -5,8 +5,11 @@
 // Example go2rtc.yaml:
 //
 //	streams:
-//	  granary:   petlibro://192.168.1.66?uid=HG2SYGTKEP4HG3CA111A&audio=true
-//	  underbench: petlibro://192.168.1.84?uid=26JFLE2XWUXWU39S111A&quality=sd
+//	  cam1: petlibro://<camera-ip>?uid=<20-char-UID>&audio=true
+//	  cam2: petlibro://<camera-ip>?uid=<20-char-UID>&quality=sd
+//
+// The UID is the 20-character identifier printed on the camera's
+// back-label or visible in the Petlibro app under camera details.
 package petlibro
 
 import (
