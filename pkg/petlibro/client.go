@@ -893,18 +893,21 @@ func (c *Client) emit(e *pendingFrag) {
 	if e.channel == innerChSub && len(e.payload) >= 16 &&
 		e.payload[len(e.payload)-16] == CodecH264 &&
 		e.payload[len(e.payload)-12] != wantStreamID {
-		// Filtering this fragment, but still flush any pending IDR
-		// — a ch=0x07 arrival (of any stream) signals that the
-		// preceding ch=0x05 IDR is complete on the wire.  Without
-		// this the SD IDR never emits because all ch=0x07 P-frames
-		// are filtered.
-		if len(c.mainAsm.buf) > 0 {
-			// Use trailer ts from this P-frame (even though we're
-			// dropping it) as a reference for the IDR's PTS.
-			t := e.payload[len(e.payload)-4:]
-			frameTs := binary.LittleEndian.Uint32(t)
-			c.flushMainIDR(frameTs)
-		}
+		// Filter out the wrong-stream P-frame and DO NOT use it
+		// to flush the pending main-stream IDR.  When the camera
+		// dual-streams, a wrong-stream ch=0x07 P-frame can arrive
+		// on the wire BETWEEN two of our stream's IDR fragments
+		// (e.g. between frag 73 and frag 75).  Flushing here
+		// truncated the IDR at its last 1–2 fragments which carry
+		// the bottom MB rows, producing the "corrupted macroblock
+		// X 66 / X 67" pattern in mpv on every frame.
+		//
+		// The matching-stream ch=0x07 branch below still flushes,
+		// and the camera sends those at full frame rate (~15-25
+		// fps), so the IDR sits at most one P-frame interval
+		// (~40-66 ms) longer than before.  Worst-case fallback:
+		// the next IDR's first ch=0x05 fragment flushes via the
+		// new-frame-num check immediately below.
 		return
 	}
 
