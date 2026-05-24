@@ -1,6 +1,7 @@
 package petlibro
 
 import (
+	"encoding/binary"
 	"fmt"
 	"net/url"
 	"time"
@@ -177,6 +178,24 @@ func (p *Producer) Start() error {
 	}
 }
 
+// containsAVCCNALType walks an AVCC-encoded buffer (4-byte length
+// prefix + NAL bytes, repeated) and returns true if any NAL unit
+// has the given H.264 NAL type.  Use this instead of h264.NALUType
+// when the AU may have multiple NALs and SPS isn't guaranteed first.
+func containsAVCCNALType(avcc []byte, want byte) bool {
+	for len(avcc) >= 5 {
+		size := 4 + int(binary.BigEndian.Uint32(avcc))
+		if size > len(avcc) || size < 5 {
+			return false
+		}
+		if avcc[4]&0x1F == want {
+			return true
+		}
+		avcc = avcc[size:]
+	}
+	return false
+}
+
 // adtsParams returns (sampleRate, channels) from an ADTS-framed AAC
 // header.  Returns (0, 0) if the header isn't valid ADTS.
 func adtsParams(b []byte) (int, int) {
@@ -215,7 +234,11 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
 		case CodecH264:
 			if vcodec == nil {
 				buf := annexb.EncodeToAVCC(pkt.Payload)
-				if len(buf) >= 5 && h264.NALUType(buf) == h264.NALUTypeSPS {
+				// Scan ALL NAL units in the AU for an SPS — different
+				// firmware versions order them differently (some put
+				// SPS first; bench camera puts AUD/SEI first).
+				// Checking only the first NAL would miss those.
+				if containsAVCCNALType(buf, h264.NALUTypeSPS) {
 					vcodec = h264.AVCCToCodec(buf)
 					// Petlibro packs SPS+PPS+IDR into one AU; keep the
 					// Annex-B form so Start() can re-emit it verbatim.

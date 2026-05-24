@@ -291,31 +291,63 @@ func (c *Client) recvOne(timeout time.Duration) ([]byte, error) {
 // --- handshake -----------------------------------------------------------
 
 func (c *Client) handshake() error {
+	logRecv := func(label string, pkt []byte) {
+		if !c.verbose || len(pkt) < 12 {
+			return
+		}
+		mt := binary.LittleEndian.Uint16(pkt[8:])
+		flag := byte(0)
+		if len(pkt) > 3 {
+			flag = pkt[3]
+		}
+		var innerInfo string
+		if len(pkt) >= 0x1C+0x1A {
+			inner := pkt[0x1C:]
+			innerInfo = fmt.Sprintf(" inner[0]=%02x inner[1]=%02x inner[24]=%02x",
+				inner[0], inner[1], inner[0x18])
+		}
+		fmt.Printf("[petlibro/hs] %s: mt=0x%04x flags=0x%02x len=%d%s\n",
+			label, mt, flag, len(pkt), innerInfo)
+	}
+
 	if err := c.send(buildLANSearch3(c.uid, c.nonce, 1)); err != nil {
 		return err
 	}
+	gotLANSearchR := false
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		pkt, err := c.recvOne(500 * time.Millisecond)
 		if err != nil || len(pkt) < 12 {
 			continue
 		}
+		logRecv("after-LAN_SEARCH3-w3=1", pkt)
 		if binary.LittleEndian.Uint16(pkt[8:]) == msgLANSearchR {
+			gotLANSearchR = true
 			break
 		}
 	}
+	if c.verbose && !gotLANSearchR {
+		fmt.Printf("[petlibro/hs] WARNING: never received LAN_SEARCH_R from %s\n", c.cam)
+	}
+
 	_ = c.send(buildLANSearch3(c.uid, c.nonce, 2))
 	time.Sleep(30 * time.Millisecond)
 	_ = c.send(buildKnock2(c.uid, c.nonce))
+	gotKnockRR2 := false
 	deadline = time.Now().Add(1500 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		pkt, err := c.recvOne(500 * time.Millisecond)
 		if err != nil || len(pkt) < 12 {
 			continue
 		}
+		logRecv("after-KNOCK2", pkt)
 		if binary.LittleEndian.Uint16(pkt[8:]) == msgKnockRR2 {
+			gotKnockRR2 = true
 			break
 		}
+	}
+	if c.verbose && !gotKnockRR2 {
+		fmt.Printf("[petlibro/hs] WARNING: never received KNOCK_RR2 from %s\n", c.cam)
 	}
 
 	// DTLS-shaped first packet (datatype=1, kseq=0)
@@ -346,6 +378,7 @@ func (c *Client) handshake() error {
 		if err != nil || len(pkt) < 0x1C+0x1A {
 			continue
 		}
+		logRecv("after-LOGIN", pkt)
 		if binary.LittleEndian.Uint16(pkt[8:]) != msgSessionD2C {
 			continue
 		}
