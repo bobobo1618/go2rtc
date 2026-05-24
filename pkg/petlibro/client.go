@@ -1055,18 +1055,32 @@ func (c *Client) emit(e *pendingFrag) {
 
 	if gapped {
 		// Strict mode: drop the entire GOP for pristine pixels.
-		// Non-strict mode (default): emit the partial frame anyway.
-		// Even a slice with a mid-frame hole gives the H.264 decoder
-		// SOMETHING to reference for the next ~50 P-frames, and any
-		// visual artefacts at the hole location are far less
-		// disruptive than the multi-second freeze that results from
-		// the decoder waiting for the next clean IDR.
 		if c.strict {
 			c.gopPoisoned = true
 			c.stats.vidDropped++
 			return
 		}
-		c.stats.vidDropped++ // still counted as "would-have-dropped"
+		// Non-strict mode (default), per channel:
+		//   * IDR on ch=0x05: emit the partial frame.  A slice with a
+		//     mid-frame hole still gives the decoder SOMETHING to
+		//     reference for the next ~25-50 P-frames, and macroblock
+		//     artefacts at the hole location are far less disruptive
+		//     than the multi-second freeze that results from dropping
+		//     the IDR and waiting for the next clean one.
+		//   * P-frame on ch=0x07: DROP.  A truncated P-frame slice
+		//     causes the decoder to mis-parse the bitstream mid-way
+		//     and the resulting errors ("mb_type 533 in I slice too
+		//     large", "P sub_mb_type 11 out of range", etc) cascade
+		//     into every subsequent P-frame in the GOP via reference
+		//     prediction.  The decoder recovers automatically at the
+		//     next clean P-frame (P-frames only reference the IDR,
+		//     not each other for slice-data validity), so dropping
+		//     ONE gapped P-frame loses one frame; emitting it loses
+		//     the rest of the GOP to cascading decoder errors.
+		c.stats.vidDropped++
+		if e.channel != innerChMain {
+			return
+		}
 	}
 	c.pendingFrameTs = frameTs
 	c.havePendingTs = true
