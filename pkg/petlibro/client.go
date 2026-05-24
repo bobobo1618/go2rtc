@@ -1028,6 +1028,25 @@ func (c *Client) emit(e *pendingFrag) {
 		asm.curAUGapped = true
 	}
 
+	// Hard floor: if we got the end-fragment but ZERO data fragments
+	// for a multi-fragment frame, the AU has no slice header — only
+	// trailing bits.  The decoder can't make sense of that and
+	// produces a cascade of "out of range intra chroma pred mode" /
+	// "mb_type X in I slice too large" / "top block unavailable"
+	// errors that contaminate playback well past the next IDR.  Drop
+	// it instead of emitting garbage.
+	if expectedData >= 1 && asm.curAUDataCount == 0 {
+		c.stats.fragSkips++
+		c.stats.fragsLost += uint64(expectedData)
+		c.stats.vidDropped++
+		asm.reset()
+		asm.curFrameNum = 0
+		if c.strict && e.channel == innerChMain {
+			c.gopPoisoned = true
+		}
+		return
+	}
+
 	au := append([]byte(nil), asm.buf...)
 	gapped := asm.curAUGapped
 	wasMain := e.channel == innerChMain
