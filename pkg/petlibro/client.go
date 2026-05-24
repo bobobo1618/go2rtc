@@ -1057,12 +1057,15 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	}
 	c.mainAsm.reset()
 	c.mainAsm.curFrameNum = 0
-	if c.strict {
+	if midGapped || c.strict {
+		// Mid-frame fragment loss means the slice has a hole in the
+		// middle — decoder can't conceal that cleanly, produces
+		// cascading errors that contaminate every later P-frame in
+		// the GOP via inter-frame prediction.  Drop the IDR.
 		c.gopPoisoned = true
 		c.stats.vidDropped++
 		return
 	}
-	_ = midGapped
 	_ = tailMissing
 	if nextPFrameTs != 0 {
 		idrTs := nextPFrameTs - 40
