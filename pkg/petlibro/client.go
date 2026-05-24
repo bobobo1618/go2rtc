@@ -707,7 +707,18 @@ func (c *Client) handleIncoming(pkt []byte) {
 	)
 	switch {
 	case (channel == innerChMain || channel == innerChSub) &&
-		(b1 == 0x00 || b1 == 0x04 || b1 == 0x05):
+		(b1 == 0x00 || b1 == 0x01 || b1 == 0x04 || b1 == 0x05):
+		// b1=0x01 is the IDR END-FRAGMENT marker — verified on
+		// PLAF203 firmware: the 78-fragment HD IDR has 77 data
+		// fragments (b1=0x00/0x04, paylen=1024) followed by ONE
+		// b1=0x01 sub17=0x01 fragment (paylen ~288, ends with the
+		// trailer signature 4e 00 01 00 <stream_id> 00*7 <ts>).
+		// That last fragment carries the bottom MB rows of the
+		// slice — without it ffmpeg fails decoding rows 66-67 on
+		// every IDR ("corrupted macroblock X 66", "out of range
+		// intra chroma pred mode", etc).  Earlier code only
+		// accepted b1 in {0x00,0x04,0x05} and silently dropped
+		// every IDR end-fragment.
 		isAV = true
 		payload = sliceWithPaylen(36)
 	case channel == innerChAudio && sub17 == 0x01 &&
