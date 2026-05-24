@@ -978,7 +978,7 @@ func (c *Client) emit(e *pendingFrag) {
 	// trailer signature if present, otherwise flush the IDR on the
 	// next ch=0x07 arrival.
 
-	stripped, frameTs, hasTrailer := stripFragmentMetadataTrailer(e.payload)
+	stripped, frameTs, trailerStreamID, hasTrailer := stripFragmentMetadataTrailer(e.payload)
 	if c.dumpFile != nil {
 		if hasTrailer {
 			_, _ = c.dumpFile.Write(stripped)
@@ -1049,7 +1049,28 @@ func (c *Client) emit(e *pendingFrag) {
 		return
 	}
 
-	// End-of-frame fragment.  Append trailer-stripped payload and emit.
+	// End-of-frame fragment.  First, if the trailer's stream-id tells
+	// us this frame is from the WRONG stream (camera dual-streaming
+	// HD+SD on the same channel and we want one but the end-fragment
+	// is the other's), discard the accumulated data fragments — they
+	// belonged to the wrong-stream frame.  This pairs with the
+	// removal of the per-fragment totalFrags filter: data fragments
+	// (b1=0x00) carry no stream-id, so we accumulate them
+	// optimistically; the trailer-bearing end-fragment is where we
+	// learn the real stream identity and can correct course.
+	//
+	// Note: this assumes the camera serialises its streams (sends
+	// all of HD's fragments contiguously, then all of SD's), which
+	// matches what we've observed in dual-stream-mode captures.  If
+	// a camera ever interleaves them within a single AU, we'd need
+	// per-frame_num buffering instead.
+	if trailerStreamID != 0 && trailerStreamID != wantStreamID {
+		c.stats.vidDropped++
+		asm.reset()
+		asm.curFrameNum = 0
+		return
+	}
+
 	asm.buf = append(asm.buf, stripped...)
 	expectedData := uint16(0)
 	if asm.curAUTotal > 0 {
@@ -1273,9 +1294,9 @@ func (c *Client) emitAU(au []byte) {
 // Callers should only invoke this on the frame's end fragment (whose
 // tail unambiguously matches the signature) — in mid-frame fragments
 // a coincidental match could shear real slice bytes.
-func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs bool) {
+func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, streamID byte, hasTs bool) {
 	if len(p) < 16 {
-		return p, 0, false
+		return p, 0, 0, false
 	}
 	t := p[len(p)-15:] // 15-byte trailer right after the codec_id byte
 	prefixOK := t[0] == 0x00 && (t[1] == 0x00 || t[1] == 0x01) &&
@@ -1285,9 +1306,9 @@ func stripFragmentMetadataTrailer(p []byte) (stripped []byte, ts uint32, hasTs b
 	codecIDOK := p[len(p)-16] == CodecH264
 	if prefixOK && zerosOK && codecIDOK {
 		ts = binary.LittleEndian.Uint32(t[11:15])
-		return p[:len(p)-16], ts, true
+		return p[:len(p)-16], ts, t[3], true
 	}
-	return p, 0, false
+	return p, 0, 0, false
 }
 
 // containsNALType reports whether the Annex-B buffer contains any NAL
