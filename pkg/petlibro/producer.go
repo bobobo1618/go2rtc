@@ -3,7 +3,7 @@ package petlibro
 import (
 	"encoding/binary"
 	"fmt"
-	"net/url"
+	"sync/atomic"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
@@ -23,48 +23,36 @@ type Producer struct {
 	// up to a full GOP for the next IDR.  Annex-B encoded.
 	firstAU []byte
 	firstTS uint32
-	firstFN uint32
+
+	// rtpSeq is the producer-side monotonic RTP sequence counter for
+	// the video track.  Earlier code copied pkt.FrameNo (the camera's
+	// per-channel frame counter, also used for the SPS-replay seq)
+	// straight into the RTP header, which collided with the replayed
+	// IDR's seq number and caused mpv to drop the second IDR as a
+	// "non-monotonic" duplicate.
+	rtpSeq atomic.Uint32
 }
 
 // NewProducer parses a petlibro:// URL, dials the camera, probes the
 // codec (waits for an SPS so we can build a proper SDP), and returns a
 // fully-populated Producer.
 //
-// URL shape:
+// URL shape (full grammar lives on pkg/petlibro.Dial):
 //
 //	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 //
-// `strict=1` switches to a pristine-pixels-over-fluency policy:
-// any IDR with a lost fragment is dropped (instead of emitted with
-// localised macroblock artefacts) and the rest of the GOP is
-// suppressed until the next clean IDR.  Useful when downstream
-// decoder errors are louder than the multi-second freezes strict
-// mode causes on lossy networks.
+// strict=1 — pristine-pixels-over-fluency policy: any IDR with a lost
+// fragment is dropped (instead of emitted with localised macroblock
+// artefacts) and the rest of the GOP is suppressed until the next
+// clean IDR.  Useful when downstream decoder errors are louder than
+// the multi-second freezes strict mode causes on lossy networks.
 func NewProducer(rawURL string) (*Producer, error) {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return nil, fmt.Errorf("petlibro: bad url: %w", err)
-	}
-	q := u.Query()
-
-	opts := DialOptions{
-		UID:     q.Get("uid"),
-		Host:    u.Host,
-		Audio:   q.Get("audio") == "true" || q.Get("audio") == "1",
-		Quality: q.Get("quality"),
-		Strict:  q.Get("strict") == "true" || q.Get("strict") == "1",
-		Verbose: q.Get("verbose") == "true" || q.Get("verbose") == "1",
-	}
-	if opts.UID == "" {
-		return nil, fmt.Errorf("petlibro: uid query parameter required")
-	}
-
-	client, err := Dial(opts)
+	client, err := Dial(rawURL)
 	if err != nil {
 		return nil, err
 	}
 
-	medias, firstAU, firstTS, firstFN, err := probe(client)
+	medias, firstAU, firstTS, err := probe(client)
 	if err != nil {
 		_ = client.Close()
 		return nil, err
@@ -83,8 +71,11 @@ func NewProducer(rawURL string) (*Producer, error) {
 		client:  client,
 		firstAU: firstAU,
 		firstTS: firstTS,
-		firstFN: firstFN,
 	}, nil
+}
+
+func (p *Producer) nextSeq() uint16 {
+	return uint16(p.rtpSeq.Add(1))
 }
 
 func (p *Producer) Start() error {
@@ -108,7 +99,7 @@ func (p *Producer) Start() error {
 					// produce only noise.
 					recv.WriteRTP(&core.Packet{
 						Header: rtp.Header{
-							SequenceNumber: uint16(p.firstFN),
+							SequenceNumber: p.nextSeq(),
 							Timestamp:      p.firstTS,
 						},
 						Payload: avcc,
@@ -121,7 +112,6 @@ func (p *Producer) Start() error {
 	}
 
 	for {
-		_ = p.client.SetDeadline(time.Now().Add(core.ConnDeadline))
 		pkt, err := p.client.ReadPacket()
 		if err != nil {
 			return err
@@ -149,7 +139,7 @@ func (p *Producer) Start() error {
 				continue
 			}
 			pkt2 = &core.Packet{
-				Header:  rtp.Header{SequenceNumber: uint16(pkt.FrameNo), Timestamp: pkt.Timestamp},
+				Header:  rtp.Header{SequenceNumber: p.nextSeq(), Timestamp: pkt.Timestamp},
 				Payload: avcc,
 			}
 
@@ -184,11 +174,13 @@ func (p *Producer) Start() error {
 	}
 }
 
-// containsAVCCNALType walks an AVCC-encoded buffer (4-byte length
-// prefix + NAL bytes, repeated) and returns true if any NAL unit
-// has the given H.264 NAL type.  Use this instead of h264.NALUType
-// when the AU may have multiple NALs and SPS isn't guaranteed first.
-func containsAVCCNALType(avcc []byte, want byte) bool {
+// avccContainsNALType walks an AVCC-encoded buffer (4-byte length
+// prefix + NAL bytes, repeated) and reports whether any NAL unit's
+// nal_unit_type matches want.  pkg/h264 doesn't ship an AVCC iterator
+// today; rather than copying the same five-line walk into another
+// adapter, this is the single place petlibro touches AVCC NALs.  See
+// also annexbContainsNALType in client.go for the Annex-B equivalent.
+func avccContainsNALType(avcc []byte, want byte) bool {
 	for len(avcc) >= 5 {
 		size := 4 + int(binary.BigEndian.Uint32(avcc))
 		if size > len(avcc) || size < 5 {
@@ -206,16 +198,16 @@ func containsAVCCNALType(avcc []byte, want byte) bool {
 // and, if audio was requested, an audio codec.  Returns the SPS-bearing
 // IDR's full Annex-B AU so the producer can replay it as the first
 // emitted frame, saving consumers up to one full GOP of wait time.
-func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
+func probe(client *Client) ([]*core.Media, []byte, uint32, error) {
 	_ = client.SetDeadline(time.Now().Add(core.ProbeTimeout))
 
 	var vcodec, acodec *core.Codec
 	var firstAU []byte
-	var firstTS, firstFN uint32
+	var firstTS uint32
 	for {
 		pkt, err := client.ReadPacket()
 		if err != nil {
-			return nil, nil, 0, 0, fmt.Errorf("petlibro: probe: %w", err)
+			return nil, nil, 0, fmt.Errorf("petlibro: probe: %w", err)
 		}
 		if pkt == nil || len(pkt.Payload) < 5 {
 			continue
@@ -229,13 +221,12 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
 				// firmware versions order them differently (some put
 				// SPS first; bench camera puts AUD/SEI first).
 				// Checking only the first NAL would miss those.
-				if containsAVCCNALType(buf, h264.NALUTypeSPS) {
+				if avccContainsNALType(buf, h264.NALUTypeSPS) {
 					vcodec = h264.AVCCToCodec(buf)
 					// Petlibro packs SPS+PPS+IDR into one AU; keep the
 					// Annex-B form so Start() can re-emit it verbatim.
 					firstAU = append([]byte(nil), pkt.Payload...)
 					firstTS = pkt.Timestamp
-					firstFN = pkt.FrameNo
 				}
 			}
 		case CodecAACADTS:
@@ -269,5 +260,5 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, uint32, error) {
 			Codecs:    []*core.Codec{acodec},
 		})
 	}
-	return medias, firstAU, firstTS, firstFN, nil
+	return medias, firstAU, firstTS, nil
 }

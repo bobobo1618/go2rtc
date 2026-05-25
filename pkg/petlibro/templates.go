@@ -2,7 +2,6 @@ package petlibro
 
 import (
 	"encoding/binary"
-	"encoding/hex"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
 )
@@ -17,12 +16,21 @@ const (
 
 	// Outer Kalay header (28 bytes) - byte 2 is the protocol version
 	// (0x1D for Petlibro firmware vs 0x19 for Wyze).
+	//
+	// petlibro divergence vs pkg/tutk: tutk hard-codes the magic prefix
+	// "\x04\x02\x12\x0a" or "\x04\x02\x19\x0a" inline in
+	// pkg/tutk/session16.go (Session16.Msg) and elsewhere; byte 2 there
+	// is 0x12/0x19 and byte 3 is 0x0a.  Petlibro firmware insists on
+	// 0x1D at byte 2 and varies byte 3 by message kind
+	// (flagsControl/flagsSession/flagsRecv).  The byte-2 fork is the
+	// load-bearing constant for any future pkg/tutk consolidation.
 	magicVersion = 0x1D
 
 	// flags at outer byte 3
 	flagsControl = 0x02 // LAN_SEARCH3, KNOCK2
 	flagsSession = 0x0B // 0x407 phone→cam data
 	flagsRecv    = 0x0A // 0x408 cam→phone
+	flagsAlive   = 0x0A // 0x427 phone→cam keepalive (same wire value as flagsRecv)
 
 	// IOTC msg-type field at offset 8..9 of the outer header
 	msgLANSearch3 uint16 = 0x0601
@@ -50,11 +58,12 @@ var sdkVersion = []byte{0x00, 0x08, 0x03, 0x04}
 // starting, but matching the app's sequence avoids edge-case
 // firmware quirks on some camera models.
 const (
-	ioctlVendor0322 uint32 = 0x0322
-	ioctlVendor032A uint32 = 0x032A
-	ioctlVendor0372 uint32 = 0x0372
-	ioctlStart      uint32 = 0x01FF // IPCAM_START
-	ioctlAudioOn    uint32 = 0x0300 // AUDIO_ENABLE
+	ioctlSetStreamCtrl uint32 = 0x0024 // SETSTREAMCTRL (qualityHD/qualitySD bodies, byte 0)
+	ioctlVendor0322    uint32 = 0x0322
+	ioctlVendor032A    uint32 = 0x032A
+	ioctlVendor0372    uint32 = 0x0372
+	ioctlStart         uint32 = 0x01FF // IPCAM_START
+	ioctlAudioOn       uint32 = 0x0300 // AUDIO_ENABLE
 )
 
 // SETSTREAMCTRL bodies (12 bytes) — IOCtrl 0x0024 wire payload.
@@ -65,8 +74,8 @@ const (
 // told to enable; the HD/SD on/off state is sticky in the camera's
 // cloud config (set via the Petlibro app), not toggled per-session.
 var (
-	qualityHD = []byte{0x24, 0, 0, 0, 0x01, 0x00, 0xff, 0x3f, 0, 0, 0, 0}
-	qualitySD = []byte{0x24, 0, 0, 0, 0x02, 0x00, 0x8a, 0x81, 0, 0, 0, 0}
+	qualityHD = []byte{byte(ioctlSetStreamCtrl), 0, 0, 0, 0x01, 0x00, 0xff, 0x3f, 0, 0, 0, 0}
+	qualitySD = []byte{byte(ioctlSetStreamCtrl), 0, 0, 0, 0x02, 0x00, 0x8a, 0x81, 0, 0, 0, 0}
 )
 
 // Inner-cmd "channel" markers at offset 16..17.
@@ -78,6 +87,14 @@ const (
 
 // XOR key applied to IOCtrl bodies (the "outer" Charlie key — same one
 // pkg/tutk uses for its TransCodePartial, just here at the body level).
+//
+// petlibro divergence vs pkg/tutk: pkg/tutk uses the full 32-byte
+// charlie string "Charlie is the designer of P2P!!" (pkg/tutk/crypto.go:9)
+// as a Luffy round-key.  Petlibro instead takes only the first 16
+// bytes ("Charlie is the d") and uses it as a plain repeating XOR
+// stream against IOCtrl payloads — a second, weaker scrambling layer
+// the camera firmware applies on top of the outer Luffy crypto.  Any
+// pkg/tutk consolidation needs both keys exposed.
 var xorKey = []byte("Charlie is the d")
 
 func xorBody(b []byte) []byte {
@@ -88,6 +105,17 @@ func xorBody(b []byte) []byte {
 	return out
 }
 
+// petlibro divergence vs pkg/tutk: tutk's outer header is built
+// inline by Session16.Msg (pkg/tutk/session16.go:65) — a 28-byte
+// header that hardcodes msg_type 0x0407 ("\x07\x04\x21") at offset 8,
+// has no datatype/channelID at offsets 14..15, no constant 0x0000000C
+// at 16..19, and packs the 16-byte session id at 12..27.  Petlibro
+// instead uses an 8-byte nonce at 20..27, datatype/channelID at
+// 14..15 (the original SDK reserved datatype=1 for the DTLS-shaped
+// first packet — see .omc/research/_dtls_skip_test/), and threads the
+// msg_type as msgSessionC2D = 0x0407 only when flags=flagsSession.
+// Functionally similar wrapper, four constants apart.
+//
 // buildOuter builds a 28-byte Kalay outer header + body.
 //
 //	0..3   04 02 1D <flags>
@@ -97,7 +125,10 @@ func xorBody(b []byte) []byte {
 //	10..11 subtype LE (0x0021)
 //	12..13 nonce[0..1]
 //	14     channel_id  (0 normal, 1 after PLAY re-handshake)
-//	15     datatype    (1 for DTLS-shaped, 0 otherwise)
+//	15     datatype    (always 0 in current paths; the SDK uses 1 for
+//	                   the legacy DTLS-shaped first packet, which the
+//	                   Petlibro camera turned out not to require — see
+//	                   .omc/research/_dtls_skip_test/)
 //	16..19 0x0000000C
 //	20..27 full 8-byte nonce
 //	28..   body
@@ -122,6 +153,15 @@ func buildOuter(nonce []byte, seq uint16, body []byte, datatype, channelID, flag
 	return p
 }
 
+// petlibro divergence vs pkg/tutk: pkg/tutk has NO LAN_SEARCH /
+// KNOCK opcodes at all — tutk reaches the camera through Nebula
+// (pkg/tutk/conn.go:31 connectDirect / connectRemote, which routes
+// via Kalay's relay infrastructure when the camera isn't directly
+// addressable).  Petlibro instead probes the LAN with msgLANSearch3
+// (0x0601) and KNOCK2 (0x0402) before sending any inner-session data,
+// matching what PCAPdroid captures show the official Petlibro app
+// doing.  There is no tutk symbol to reuse here; the LAN_SEARCH3 /
+// KNOCK2 wire format is petlibro-specific.
 func buildLANSearch3(uid string, nonce []byte, w3 byte) []byte {
 	p := make([]byte, 88)
 	p[0] = 0x04
@@ -139,6 +179,11 @@ func buildLANSearch3(uid string, nonce []byte, w3 byte) []byte {
 	return p
 }
 
+// petlibro divergence vs pkg/tutk: see buildLANSearch3 above — KNOCK2
+// (msgKnock2 = 0x0402) is the second leg of the petlibro LAN probe and
+// has no pkg/tutk equivalent.  Carries a 16-bit subtype 0x0033 (vs
+// 0x0021 for control msgs) and tail-pads the SDK version bytes at
+// offset 0x30 instead of 0x34.
 func buildKnock2(uid string, nonce []byte) []byte {
 	p := make([]byte, 52)
 	p[0] = 0x04
@@ -159,7 +204,7 @@ func buildAliveC2D(nonce []byte) []byte {
 	p[0] = 0x04
 	p[1] = 0x02
 	p[2] = magicVersion
-	p[3] = 0x0A
+	p[3] = flagsAlive
 	binary.LittleEndian.PutUint16(p[4:], 8)
 	binary.LittleEndian.PutUint16(p[8:], msgAliveC2D)
 	binary.LittleEndian.PutUint16(p[10:], 0x0012)
@@ -239,32 +284,38 @@ func ioctlBody12(ctrlID uint32) []byte {
 	return b
 }
 
-// DTLS template — verbatim from petliapp.pcap frame 1596.
-const dtlsTemplateHex = "" +
-	"16feff000000000000000000f4010000e800000000000000e8fefd" +
-	"00000000000000000000000000000000000000000000000000" + // 25 random bytes
-	"46dcc424862dad" +
-	"cf000000000000b800" + // 9 dynamic/static bytes
-	"7a60c0248d01edee144f2ee82ec0a1a02bacc2e485412d4f6462e462e60cb17c" +
-	"6a6c08288e9d61c678eee7728e0cbddc4771cae48e8d6d8f3443eeea2e00addc" +
-	"d7e1cbe48d9ded0f245fe576af0cbd6ca6b1c9e48d8dad451402ec76070cb15c" +
-	"a6d1c6e4a43dedbc1832e4cc3b0cbdec5671c2e4853d4d6de8f2f64a840cadcc" +
-	"86b0c3e4853dad6c7853e762840cad1cb6e042ec043d2b6c3872e668b44cfd2c" +
-	"e78082e0f43da50c7872664a84842d5c426b62716d6a67246b7622726a"
-
 // AV-LOGIN wire constants. Verified byte-exact against 36 captured
-// PCAPdroid LOGIN buffers from the official Petlibro Android app on
-// PLAF103/PLAF203 cameras. Plaintext recovered via Luffy round-trip
-// (decoder source at .omc/research/_decode/main.go); see
-// .omc/research/login_plaintext.md for the full field map.
+// LOGIN buffers from the official Petlibro Android app on PLAF103 /
+// PLAF203 cameras. See internal/petlibro/README.md "Wire protocol
+// references" for the reverse-engineering trail and the full plaintext
+// field map summarised here:
+//
+//	wrapper:      4 B inner-cmd magic + 12 B pad + 4 B AV header + 4 B login_serial
+//	view_account: "admin" + zero pad, 257 B total (12 B head plaintext,
+//	              245 B tail inside the Luffy region)
+//	view_password: "888888" + zero pad, 257 B inside the Luffy region
+//	trailer (32 B for LOGIN A, 34 B for LOGIN B):
+//	  +0x00 u32 LE trailer_flag_0 = 1
+//	  +0x04 u32 LE opcode_support_count = 4
+//	  +0x08 [4]u32 LE opcode_support_bitmap = {0x001F07FB, 0, 0, 0x00030000}
+//	  +0x18 u8 auth_type = 0 (AUTHPWD) + 3 B pad
+//	  +0x1C u8 enable_video_on_connect = 1 + 3 B pad
+//	  +0x20 u8 enable_audio_on_connect (LOGIN B only) + 1 B pad
 const (
 	// view_account / view_password are each padded to sdkPaddedLen
 	// (acc_len = pw_len = 0x101 = 257 B in the modern TUTK SDK).
 	sdkPaddedLen = 0x101
 
-	// Petlibro firmware-default credentials. Wire bytes are identical
-	// across every camera observed in capture; these may be a global
-	// Petlibro default. See LOGIN_ANALYSIS.md §0.
+	// Petlibro firmware-default credentials. These are NOT a user
+	// secret and MUST NOT be exposed as a URL parameter or env var.
+	// The same "admin" / "888888" pair appears in all 36 captured
+	// LOGIN buffers across multiple cameras and account owners — the
+	// LAN AV-LOGIN check is effectively a no-op on this firmware.
+	// Real access control happens upstream at the Nebula whitelist
+	// gating UDP/32761 reachability; once the camera answers
+	// LAN_SEARCH3 the LOGIN goes through with these constants.
+	// Changing the camera password in the Petlibro app does NOT
+	// change what the firmware accepts here.
 	viewAccount  = "admin"
 	viewPassword = "888888"
 
@@ -326,40 +377,6 @@ var (
 	}
 )
 
-var dtlsTemplate []byte
-
-func init() {
-	dtlsTemplate = mustHex(dtlsTemplateHex)
-	if len(dtlsTemplate) != 257 {
-		panic("petlibro: dtls template length wrong")
-	}
-	// Build sanity check — same lengths the wire bytes have always had.
-	a, b := buildLoginPair(0)
-	if len(a) != 570 || len(b) != 572 {
-		panic("petlibro: login template length wrong")
-	}
-}
-
-func mustHex(s string) []byte {
-	b, err := hex.DecodeString(s)
-	if err != nil {
-		panic(err)
-	}
-	return b
-}
-
-// buildDTLSBody returns a randomised DTLS-shaped first-packet body
-// (257 B).  Camera-side parser only checks the fixed prefix/suffix
-// pattern; the dynamic regions get fresh random bytes per session.
-func buildDTLSBody(rand32 []byte) []byte {
-	b := make([]byte, len(dtlsTemplate))
-	copy(b, dtlsTemplate)
-	copy(b[27:52], rand32[:25])
-	copy(b[60:66], rand32[25:31])
-	b[67] = rand32[31]
-	return b
-}
-
 // buildLoginPair returns (loginA, loginB) inner bodies for the
 // AV-LOGIN handshake with a fresh 32-bit session seed at wrapper
 // offset 0x14. B's login_serial is always A's + 1 (invariant per the
@@ -412,10 +429,10 @@ func buildLogin(wrapperHead []byte, loginSerial uint32, isLogin1 bool) []byte {
 	binary.LittleEndian.PutUint32(tr[0x0C:], opcodeSupportBitmap[1])
 	binary.LittleEndian.PutUint32(tr[0x10:], opcodeSupportBitmap[2])
 	binary.LittleEndian.PutUint32(tr[0x14:], opcodeSupportBitmap[3])
-	tr[0x18] = authTypePassword          // + 3 B alignment padding (already zero)
-	tr[0x1C] = enableVideoOnConnect      // + 3 B alignment padding (already zero)
+	tr[0x18] = authTypePassword     // + 3 B alignment padding (already zero)
+	tr[0x1C] = enableVideoOnConnect // + 3 B alignment padding (already zero)
 	if isLogin1 {
-		tr[0x20] = enableAudioOnConnect  // + 1 B alignment padding (already zero)
+		tr[0x20] = enableAudioOnConnect // + 1 B alignment padding (already zero)
 	}
 
 	// 3. Luffy-encrypt the plaintext body. The pkg/tutk names are
