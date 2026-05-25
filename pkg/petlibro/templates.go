@@ -3,6 +3,8 @@ package petlibro
 import (
 	"encoding/binary"
 	"encoding/hex"
+
+	"github.com/AlexxIT/go2rtc/pkg/tutk"
 )
 
 // Petlibro / Kalay LAN protocol constants.  Byte layouts are
@@ -237,9 +239,7 @@ func ioctlBody12(ctrlID uint32) []byte {
 	return b
 }
 
-// LOGIN A/B/DTLS templates (verbatim from petliapp.pcap frames 1596,
-// 1617, 1618 — the only dynamic field is the 4-byte session seed at
-// offset 0x14 of LOGIN A/B, replaced in buildLoginPair).
+// DTLS template — verbatim from petliapp.pcap frame 1596.
 const dtlsTemplateHex = "" +
 	"16feff000000000000000000f4010000e800000000000000e8fefd" +
 	"00000000000000000000000000000000000000000000000000" + // 25 random bytes
@@ -252,58 +252,91 @@ const dtlsTemplateHex = "" +
 	"86b0c3e4853dad6c7853e762840cad1cb6e042ec043d2b6c3872e668b44cfd2c" +
 	"e78082e0f43da50c7872664a84842d5c426b62716d6a67246b7622726a"
 
-const loginATemplateHex = "" +
-	"00000c0000000000000000000000000022020100943ea54961646d696e000000" +
-	"0000000086d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c0451c1e4840db50ce8d2e640" +
-	"878c2e8f86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0cc7d0c2e4e42d0d13e8d2e640" +
-	"840cbd0c86d0c2e4843dad2c18d3e640840cad0c436860726c69"
+// AV-LOGIN wire constants. Verified byte-exact against 36 captured
+// PCAPdroid LOGIN buffers from the official Petlibro Android app on
+// PLAF103/PLAF203 cameras. Plaintext recovered via Luffy round-trip
+// (decoder source at .omc/research/_decode/main.go); see
+// .omc/research/login_plaintext.md for the full field map.
+const (
+	// view_account / view_password are each padded to sdkPaddedLen
+	// (acc_len = pw_len = 0x101 = 257 B in the modern TUTK SDK).
+	sdkPaddedLen = 0x101
 
-const loginBTemplateHex = "" +
-	"00200c0000000000000000000000000024020000953ea54961646d696e000000" +
-	"0000000086d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c0451c1e4840db50ce8d2e640" +
-	"878c2e8f86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0c86d0c2e4842dad0ce8d2e640" +
-	"840cad0c86d0c2e4842dad0ce8d2e640840cad0cc7d0c2e4e42d0d13e8d2e640" +
-	"840cbd0c86d0c2e4843dad2c18d3e640840cad0c436861736c696520"
+	// Petlibro firmware-default credentials. Wire bytes are identical
+	// across every camera observed in capture; these may be a global
+	// Petlibro default. See LOGIN_ANALYSIS.md §0.
+	viewAccount  = "admin"
+	viewPassword = "888888"
 
-var (
-	dtlsTemplate   []byte
-	loginATemplate []byte
-	loginBTemplate []byte
+	// First 12 B of view_account live in the plaintext wrapper (outside
+	// the cipher region); the remaining 245 B are zero-padding inside.
+	viewAccountHeadLen = 12
+	viewAccountTailLen = sdkPaddedLen - viewAccountHeadLen // 245
+
+	// Offset within the encrypted body where the trailer fields begin.
+	trailerOffset = viewAccountTailLen + sdkPaddedLen // 245 + 257 = 502
+
+	// Trailer field byte sizes.
+	trailerLenLogin  = 32 // LOGIN (A)
+	trailerLenLogin1 = 34 // LOGIN_1 (B) — adds enable_audio_on_connect (1 B) + pad (1 B)
+
+	// AUTHPWD — auth_type = 0 (per login_c.md line 416).
+	authTypePassword byte = 0
+
+	// trailer_flag_0 — u32 LE = 1 in every observed capture. Candidate
+	// semantics (bResend / enable_2way) per login_c.md §3.3, neither
+	// confirmed. See login_plaintext.md §6 Q2.
+	trailerFlag0 uint32 = 1
+
+	// opcode_support — bitmap of AV opcodes the client implements.
+	// Decomposition into bit→opcode-ID is unknown; treat as opaque.
+	// See login_plaintext.md §6 Q3.
+	opcodeSupportCount uint32 = 4
+
+	// enable_video_on_connect = TRUE in both A and B. enable_audio
+	// = FALSE (B-only field; absent in A). See login_plaintext.md §6 Q4.
+	enableVideoOnConnect byte = 1
+	enableAudioOnConnect byte = 0
 )
+
+// opcode_support_bitmap (4 u32 LE) — opaque constant, identical for A/B.
+var opcodeSupportBitmap = [4]uint32{0x001F07FB, 0, 0, 0x00030000}
+
+// LOGIN A/B wrapper bytes [0x00:0x18] — everything BEFORE the
+// view_account ASCII plaintext at [0x18:0x24]. Bytes [0x14:0x18] are a
+// placeholder for login_serial, overwritten at build time.
+//
+// The AV-header bytes at [0x10:0x14] (`22 02 01 00` for A, `24 02 00 00`
+// for B) discriminate the inner-cmd subtype on the wire. Their exact
+// semantic decomposition is unverified — see login_plaintext.md §6 Q1.
+var (
+	loginAWrapperHead = []byte{
+		0x00, 0x00, 0x0c, 0x00, // inner-cmd magic: kind=0x0C, subtype=0x00 (LOGIN)
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x22, 0x02, 0x01, 0x00, // AV header (A) — see §6 Q1
+		0x00, 0x00, 0x00, 0x00, // login_serial placeholder
+	}
+	loginBWrapperHead = []byte{
+		0x00, 0x20, 0x0c, 0x00, // inner-cmd magic: subtype=0x20 (LOGIN_1)
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x24, 0x02, 0x00, 0x00, // AV header (B) — see §6 Q1
+		0x00, 0x00, 0x00, 0x00, // login_serial placeholder
+	}
+)
+
+var dtlsTemplate []byte
 
 func init() {
 	dtlsTemplate = mustHex(dtlsTemplateHex)
-	loginATemplate = mustHex(loginATemplateHex)
-	loginBTemplate = mustHex(loginBTemplateHex)
-	if len(dtlsTemplate) != 257 || len(loginATemplate) != 570 || len(loginBTemplate) != 572 {
-		panic("petlibro: template length wrong")
+	if len(dtlsTemplate) != 257 {
+		panic("petlibro: dtls template length wrong")
+	}
+	// Build sanity check — same lengths the wire bytes have always had.
+	a, b := buildLoginPair(0)
+	if len(a) != 570 || len(b) != 572 {
+		panic("petlibro: login template length wrong")
 	}
 }
 
@@ -327,14 +360,67 @@ func buildDTLSBody(rand32 []byte) []byte {
 	return b
 }
 
-// buildLoginPair returns (loginA, loginB) inner bodies with a fresh
-// 32-bit session seed at offset 0x14.  B uses seed+1.
+// buildLoginPair returns (loginA, loginB) inner bodies for the
+// AV-LOGIN handshake with a fresh 32-bit session seed at wrapper
+// offset 0x14. B's login_serial is always A's + 1 (invariant per the
+// SDK at avConnect_inner:26754 and verified in 36/36 captured pairs).
+//
+// Each body has the shape:
+//
+//	[0x00:0x18]  wrapper (inner-cmd + AV header + login_serial), plaintext
+//	[0x18:0x24]  view_account head ("admin" + 7 zero B), plaintext
+//	[0x24:end]   Luffy-encrypted body (view_account tail, view_password,
+//	             trailer fields). NOTE: encrypt = tutk.ReverseTransCodePartial;
+//	             decrypt = tutk.TransCodePartial. The names in pkg/tutk
+//	             are inverted relative to the directions they perform.
+//
+// The only consumer is client.go:363; the returned buffers go straight
+// to buildOuter (NOT through innerData/xorBody), so the Luffy pass is
+// the only transformation applied here.
 func buildLoginPair(seed uint32) ([]byte, []byte) {
-	a := make([]byte, len(loginATemplate))
-	copy(a, loginATemplate)
-	binary.LittleEndian.PutUint32(a[0x14:], seed)
-	b := make([]byte, len(loginBTemplate))
-	copy(b, loginBTemplate)
-	binary.LittleEndian.PutUint32(b[0x14:], seed+1)
+	a := buildLogin(loginAWrapperHead, seed, false)
+	b := buildLogin(loginBWrapperHead, seed+1, true)
 	return a, b
+}
+
+// buildLogin assembles one side of the LOGIN pair. isLogin1=true adds
+// the LOGIN_1-only enable_audio_on_connect field (+ 1 B padding) to
+// the trailer.
+func buildLogin(wrapperHead []byte, loginSerial uint32, isLogin1 bool) []byte {
+	// 1. Wrapper [0x00:0x18] + plaintext view_account head [0x18:0x24].
+	wrapper := make([]byte, len(wrapperHead)+viewAccountHeadLen)
+	copy(wrapper, wrapperHead)
+	binary.LittleEndian.PutUint32(wrapper[0x14:], loginSerial)
+	copy(wrapper[len(wrapperHead):], viewAccount) // zero-padded to 12 B by make
+
+	// 2. Plaintext body to be encrypted [0x24:end].
+	trailerLen := trailerLenLogin
+	if isLogin1 {
+		trailerLen = trailerLenLogin1
+	}
+	pt := make([]byte, trailerOffset+trailerLen)
+
+	// view_account tail (245 zero B) is already zero from make.
+	// view_password at body+viewAccountTailLen: "888888" + 251 zero B.
+	copy(pt[viewAccountTailLen:], viewPassword)
+
+	// Trailer fields begin at body+trailerOffset.
+	tr := pt[trailerOffset:]
+	binary.LittleEndian.PutUint32(tr[0x00:], trailerFlag0)
+	binary.LittleEndian.PutUint32(tr[0x04:], opcodeSupportCount)
+	binary.LittleEndian.PutUint32(tr[0x08:], opcodeSupportBitmap[0])
+	binary.LittleEndian.PutUint32(tr[0x0C:], opcodeSupportBitmap[1])
+	binary.LittleEndian.PutUint32(tr[0x10:], opcodeSupportBitmap[2])
+	binary.LittleEndian.PutUint32(tr[0x14:], opcodeSupportBitmap[3])
+	tr[0x18] = authTypePassword          // + 3 B alignment padding (already zero)
+	tr[0x1C] = enableVideoOnConnect      // + 3 B alignment padding (already zero)
+	if isLogin1 {
+		tr[0x20] = enableAudioOnConnect  // + 1 B alignment padding (already zero)
+	}
+
+	// 3. Luffy-encrypt the plaintext body. The pkg/tutk names are
+	// inverted: ReverseTransCodePartial is the encrypt direction here.
+	ct := tutk.ReverseTransCodePartial(nil, pt)
+
+	return append(wrapper, ct...)
 }
