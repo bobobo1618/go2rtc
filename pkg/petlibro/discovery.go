@@ -6,12 +6,23 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
 )
 
+var discoveryCache sync.Map
+
 func discoverByUID(conn *net.UDPConn, uid string, nonce []byte, subnets []string, verbose bool) (*net.UDPAddr, error) {
+	cacheKey := discoveryCacheKey(uid, subnets)
+	if cached, ok := discoveryCache.Load(cacheKey); ok {
+		ip := net.ParseIP(cached.(string))
+		if ip4 := ip.To4(); ip4 != nil {
+			return &net.UDPAddr{IP: ip4, Port: lanPort}, nil
+		}
+	}
+
 	req := tutk.TransCodePartial(nil, buildLANSearch3(uid, nonce, 1))
 	targets := discoveryTargets(subnets)
 	if len(targets) == 0 {
@@ -56,6 +67,7 @@ func discoverByUID(conn *net.UDPConn, uid string, nonce []byte, subnets []string
 			if verbose {
 				log.Debug().Msgf("discover uid=%s found=%s response=%s sent=%d recv=%d ignored=%d", uid, cam, addr, sent, recv, ignored)
 			}
+			discoveryCache.Store(cacheKey, cam.IP.String())
 			return cam, nil
 		}
 	}
@@ -69,6 +81,14 @@ func discoverByUID(conn *net.UDPConn, uid string, nonce []byte, subnets []string
 	}
 	return nil, fmt.Errorf("petlibro: camera with uid %s not found on LAN (targets=%d sample=%s sent=%d send_errs=%d recv=%d ignored=%d last_send_err=%v)",
 		uid, len(targets), sampleTargets(targets, 12), sent, sendErrs, recv, ignored, lastSendErr)
+}
+
+func discoveryCacheKey(uid string, subnets []string) string {
+	return uid + "|" + strings.Join(subnets, ",")
+}
+
+func clearDiscoveryCache(uid string, subnets []string) {
+	discoveryCache.Delete(discoveryCacheKey(uid, subnets))
 }
 
 func discoveryTargets(subnets []string) []*net.UDPAddr {
