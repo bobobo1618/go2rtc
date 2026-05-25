@@ -89,6 +89,32 @@ func Init() {
 	Modules = cfg.Mod.Modules
 }
 
+func InitEmbedded(configYAML string) {
+	Version = "1.9.14"
+	UserAgent = "go2rtc/" + Version
+
+	Info["version"] = Version
+	Info["revision"] = "embedded"
+
+	configs = nil
+	ConfigPath = ""
+	initStorage()
+	if configYAML != "" {
+		configs = append(configs, []byte(configYAML))
+		loadEnv([]byte(configYAML))
+	}
+	initLogger()
+
+	var cfg struct {
+		Mod struct {
+			Modules []string `yaml:"modules"`
+		} `yaml:"app"`
+	}
+	LoadConfig(&cfg)
+	Modules = cfg.Mod.Modules
+	Logger.Info().Str("version", Version).Str("revision", "embedded").Msg("go2rtc embedded")
+}
+
 func readRevisionTime() (revision, vcsTime string) {
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
