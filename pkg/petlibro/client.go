@@ -201,15 +201,17 @@ func (c *counters) snapshot() countersSnapshot {
 	}
 }
 
-// Dial parses a petlibro:// URL, opens a UDP socket, runs LAN_SEARCH3 +
-// KNOCK2 + LOGIN A/B + the 7-cmd Petlibro bootstrap, then starts the
-// receive worker.  Returns once IPCAM_START has been sent and the
-// AV-ready ack acknowledged — the camera will then stream video (and
-// audio if &audio=true).
+// Dial parses a petlibro:// URL, opens a UDP socket, optionally
+// discovers the camera address by UID, runs LAN_SEARCH3 + KNOCK2 +
+// LOGIN A/B + the 7-cmd Petlibro bootstrap, then starts the receive
+// worker.  Returns once IPCAM_START has been sent and the AV-ready ack
+// acknowledged — the camera will then stream video (and audio if
+// &audio=true).
 //
 // URL shape:
 //
 //	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
+//	petlibro://?uid=<UID>[&subnet=192.168.1.0/24][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 //
 //	strict=1 — drop any IDR with a fragment loss and poison the GOP
 //	           (pristine pixels at the cost of multi-second freezes
@@ -249,15 +251,17 @@ func Dial(rawURL string) (*Client, error) {
 		quality = "hd"
 	}
 
-	host := u.Host
-	if _, _, err := net.SplitHostPort(host); err != nil {
-		host = net.JoinHostPort(host, strconv.Itoa(lanPort))
+	var cam *net.UDPAddr
+	if host := u.Host; host != "" {
+		if _, _, err := net.SplitHostPort(host); err != nil {
+			host = net.JoinHostPort(host, strconv.Itoa(lanPort))
+		}
+		cam, err = net.ResolveUDPAddr("udp", host)
+		if err != nil {
+			return nil, fmt.Errorf("petlibro: resolve %s: %w", host, err)
+		}
 	}
-	cam, err := net.ResolveUDPAddr("udp", host)
-	if err != nil {
-		return nil, fmt.Errorf("petlibro: resolve %s: %w", host, err)
-	}
-	udp, err := net.ListenUDP("udp", nil)
+	udp, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		return nil, fmt.Errorf("petlibro: bind: %w", err)
 	}
@@ -294,6 +298,13 @@ func Dial(rawURL string) (*Client, error) {
 	if _, err := rand.Read(nonce); err != nil {
 		_ = udp.Close()
 		return nil, err
+	}
+	if cam == nil {
+		cam, err = discoverByUID(udp, uid, nonce, q["subnet"], verbose)
+		if err != nil {
+			_ = udp.Close()
+			return nil, err
+		}
 	}
 	c := &Client{
 		conn:    udp,

@@ -6,10 +6,11 @@
 //
 //	streams:
 //	  cam1: petlibro://<camera-ip>?uid=<20-char-UID>&audio=true
-//	  cam2: petlibro://<camera-ip>?uid=<20-char-UID>&quality=sd
+//	  cam2: petlibro://?uid=<20-char-UID>&subnet=192.168.1.0/24&quality=sd
 //
 // The UID is the 20-character identifier printed on the camera's
-// back-label or visible in the Petlibro app under camera details.
+// back-label or visible in the Petlibro app under camera details.  If
+// the URL omits the host, go2rtc discovers the local camera IP by UID.
 //
 // HD/SD-sticky caveat: the `quality=hd|sd` query parameter SELECTS
 // which already-enabled stream the camera should emit, it does NOT

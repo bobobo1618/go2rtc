@@ -40,6 +40,7 @@ type Producer struct {
 // URL shape (full grammar lives on pkg/petlibro.Dial):
 //
 //	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
+//	petlibro://?uid=<UID>[&subnet=192.168.1.0/24][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 //
 // strict=1 — pristine-pixels-over-fluency policy: any IDR with a lost
 // fragment is dropped (instead of emitted with localised macroblock

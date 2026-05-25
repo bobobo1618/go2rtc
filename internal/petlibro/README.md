@@ -25,12 +25,14 @@ cloud whitelist.
 
 ```
 petlibro://[IP]?uid=[UID][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
+petlibro://?uid=[UID][&subnet=192.168.1.0/24][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 ```
 
 | Parameter | Required | Default | Description                                                     |
 |-----------|----------|---------|-----------------------------------------------------------------|
-| `IP`      | yes      | —       | Camera's local IP address (port defaults to `32761`)            |
+| `IP`      | no       | auto    | Camera's local IP address (port defaults to `32761`); omit to discover by UID |
 | `uid`     | yes      | —       | 20-character TUTK camera UID                                    |
+| `subnet`  | no       | local   | Extra IPv4 CIDR to scan when cameras are routed, not on the local broadcast subnet |
 | `audio`   | no       | `false` | Enable AAC audio (`true` or `1`)                                |
 | `quality` | no       | `hd`    | Pick `hd` or `sd` from the camera's already-enabled streams     |
 | `strict`  | no       | `false` | Drop any IDR with fragment loss instead of emitting it gapped   |
@@ -41,7 +43,7 @@ petlibro://[IP]?uid=[UID][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 ```yaml
 streams:
   petfeeder_hd: petlibro://192.168.1.42?uid=PLAF20300000000ABCD0&audio=true
-  petfeeder_sd: petlibro://192.168.1.42?uid=PLAF20300000000ABCD0&quality=sd
+  petfeeder_sd: petlibro://?uid=PLAF20300000000ABCD0&subnet=192.168.1.0/24&quality=sd
 ```
 
 ## How to find the UID
@@ -52,10 +54,13 @@ find it in the Petlibro app under camera details — most Petlibro
 PLAF-series cameras format the UID as a printable ASCII string starting
 with the model prefix (e.g. `PLAF203...`).
 
-The camera's local IP can be discovered from your router's DHCP table
-or by running a LAN scan; the camera advertises its presence over the
-Kalay LAN_SEARCH protocol on UDP/32761 but go2rtc requires you to
-already know the IP.
+If you omit the IP, go2rtc sends a UID-specific Kalay LAN_SEARCH probe
+on UDP/32761 and uses the source address from the matching camera's
+reply. This requires go2rtc and the camera to be on the same broadcast
+domain; Docker deployments usually need host networking for discovery.
+If cameras are on a routed subnet, add `subnet=192.168.1.0/24` so
+go2rtc can unicast the same probe across that network. You can still
+provide a fixed IP to skip discovery.
 
 ## Stream quality
 
@@ -136,9 +141,10 @@ causes (in observed-frequency order):
 2. **Wrong UID.** The camera silently ignores LOGIN bytes whose
    embedded `view_account` doesn't resolve to a known camera. Verify
    the 20-character UID matches the label.
-3. **Wrong IP.** `petlibro://` doesn't do mDNS — you must supply the
-   camera's current LAN IP. Re-check after a router reboot if DHCP
-   reassigned.
+3. **Wrong IP or LAN discovery blocked.** Re-check the camera's current
+   LAN IP after a router reboot if DHCP reassigned it. If using the
+   UID-only URL, verify go2rtc is on the same broadcast domain as the
+   camera; Docker usually needs host networking.
 4. **Camera offline / unreachable.** Standard ICMP/UDP-32761 reachability.
 
 The `verbose=1` URL parameter enables handshake tracing to stdout so
@@ -184,4 +190,3 @@ Key constants:
   stream-id + 7 zero bytes + 4 B LE ms timestamp). See
   `pkg/petlibro/client.go` `stripFragmentMetadataTrailer` and the
   per-channel `channelAsm` state.
-
