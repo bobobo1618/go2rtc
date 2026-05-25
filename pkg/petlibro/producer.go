@@ -234,6 +234,7 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, error) {
 				// aac.ADTSToCodec validates the header and fills in
 				// sample rate / channels / AudioSpecificConfig for us.
 				if c := aac.ADTSToCodec(pkt.Payload); c != nil {
+					c.PayloadType = core.PayloadTypeRAW
 					acodec = c
 				}
 			}
