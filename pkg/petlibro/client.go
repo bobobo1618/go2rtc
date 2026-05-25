@@ -320,10 +320,12 @@ func Dial(rawURL string) (*Client, error) {
 		done:    make(chan struct{}),
 	}
 	if err := c.handshake(); err != nil {
+		clearDiscoveryCache(uid, q["subnet"])
 		_ = udp.Close()
 		return nil, err
 	}
 	if err := c.bootstrap(); err != nil {
+		clearDiscoveryCache(uid, q["subnet"])
 		_ = udp.Close()
 		return nil, err
 	}

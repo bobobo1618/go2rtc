@@ -3,6 +3,7 @@ package petlibro
 import (
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -48,6 +49,23 @@ type Producer struct {
 // clean IDR.  Useful when downstream decoder errors are louder than
 // the multi-second freezes strict mode causes on lossy networks.
 func NewProducer(rawURL string) (*Producer, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		producer, err := newProducer(rawURL)
+		if err == nil {
+			return producer, nil
+		}
+		lastErr = err
+		if !retryStartupError(err) {
+			break
+		}
+		log.Warn().Msgf("petlibro: startup attempt %d failed: %v", attempt, err)
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func newProducer(rawURL string) (*Producer, error) {
 	client, err := Dial(rawURL)
 	if err != nil {
 		return nil, err
@@ -73,6 +91,16 @@ func NewProducer(rawURL string) (*Producer, error) {
 		firstAU: firstAU,
 		firstTS: firstTS,
 	}, nil
+}
+
+func retryStartupError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "LOGIN_RESP timeout") ||
+		strings.Contains(msg, "petlibro: probe timeout") ||
+		strings.Contains(msg, "petlibro: probe: EOF")
 }
 
 func (p *Producer) nextSeq() uint16 {
@@ -200,7 +228,12 @@ func avccContainsNALType(avcc []byte, want byte) bool {
 // IDR's full Annex-B AU so the producer can replay it as the first
 // emitted frame, saving consumers up to one full GOP of wait time.
 func probe(client *Client) ([]*core.Media, []byte, uint32, error) {
-	_ = client.SetDeadline(time.Now().Add(core.ProbeTimeout))
+	var timedOut atomic.Bool
+	timer := time.AfterFunc(core.ProbeTimeout, func() {
+		timedOut.Store(true)
+		_ = client.Close()
+	})
+	defer timer.Stop()
 
 	var vcodec, acodec *core.Codec
 	var firstAU []byte
@@ -208,6 +241,9 @@ func probe(client *Client) ([]*core.Media, []byte, uint32, error) {
 	for {
 		pkt, err := client.ReadPacket()
 		if err != nil {
+			if timedOut.Load() {
+				return nil, nil, 0, fmt.Errorf("petlibro: probe timeout")
+			}
 			return nil, nil, 0, fmt.Errorf("petlibro: probe: %w", err)
 		}
 		if pkt == nil || len(pkt.Payload) < 5 {
