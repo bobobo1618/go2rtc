@@ -580,11 +580,8 @@ func TestDualStreamFilterSubSingleFragment(t *testing.T) {
 // partial IDR" comment near channelAsm's docstring.
 //
 // Wire sequence: IDR-data on ch=0x05, then sub P-frame on ch=0x07,
-// then IDR-end on ch=0x05. The cross-channel arrival of the ch=0x07
-// sub frame triggers flushMainIDR() which emits the in-progress main
-// buffer; we assert both AUs reach the consumer queue (the regression
-// is "shared buffer would drop every partial IDR" — here neither side
-// gets dropped).
+// then IDR-end on ch=0x05. The P-frame must be deferred until the
+// complete IDR, including its end-fragment tail, has been emitted.
 func TestChannelAsmInterleavedMainAndSub(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
 
@@ -600,18 +597,13 @@ func TestChannelAsmInterleavedMainAndSub(t *testing.T) {
 		subWire: 0x4000, totalFrags: 2, fragIdx: 0,
 		paylen: uint16(len(mainData)), frameNum: 100, payload: mainData,
 	}))
-	// P-frame on ch=0x07 arrives between the IDR's data and end —
-	// triggers flushMainIDR() in emit().
+	// P-frame on ch=0x07 arrives between the IDR's data and end.
 	subEnd := makeTrailerPayload([]byte{0x77, 0x88, 0x99, 0xAA, 0xBB}, false, 0x01, 1500)
 	c.parseDatagram(makePkt(fragSpec{
 		channel: innerChSub, b1: 0x00,
 		subWire: 0x4001, totalFrags: 1, fragIdx: 0,
 		paylen: uint16(len(subEnd)), frameNum: 200, payload: subEnd,
 	}))
-	// IDR's end fragment. mainAsm was reset by the flushMainIDR; this
-	// end-fragment now arrives "orphaned" and hits the hard-floor
-	// (expectedData=1, curAUDataCount=0) → dropped. The earlier
-	// flushMainIDR is what carries the IDR through.
 	mainEnd := makeTrailerPayload([]byte{0xEE, 0xDD, 0xCC, 0xBB, 0xAA}, true, 0x01, 1000)
 	c.parseDatagram(makePkt(fragSpec{
 		channel: innerChMain, b1: 0x01, sub17: 0x01,
@@ -620,22 +612,73 @@ func TestChannelAsmInterleavedMainAndSub(t *testing.T) {
 	}))
 
 	pkts := drainAll(c)
-	if len(pkts) < 2 {
-		t.Fatalf("emitted %d packets, want >= 2 (both keyframe and P-frame must survive)", len(pkts))
+	if len(pkts) != 2 {
+		t.Fatalf("emitted %d packets, want 2 (complete IDR, then deferred P-frame)", len(pkts))
 	}
-	var sawKey, sawP bool
-	for _, p := range pkts {
-		if p.IsKeyframe {
-			sawKey = true
-		} else {
-			sawP = true
-		}
+	if !pkts[0].IsKeyframe {
+		t.Fatalf("first packet is not the completed IDR")
 	}
-	if !sawKey {
-		t.Errorf("no keyframe in output; ch=0x05 IDR was lost to cross-channel interleave")
+	if pkts[1].IsKeyframe {
+		t.Fatalf("second packet is keyframe, want deferred P-frame")
 	}
-	if !sawP {
-		t.Errorf("no P-frame in output; ch=0x07 P-frame was lost to mid-IDR arrival")
+	wantKey := append(append([]byte{}, mainData...), []byte{0xEE, 0xDD, 0xCC, 0xBB, 0xAA}...)
+	if string(pkts[0].Payload) != string(wantKey) {
+		t.Fatalf("IDR payload missing tail:\n got=%x\nwant=%x", pkts[0].Payload, wantKey)
+	}
+	wantP := []byte{0x77, 0x88, 0x99, 0xAA, 0xBB}
+	if string(pkts[1].Payload) != string(wantP) {
+		t.Fatalf("P payload=%x, want %x", pkts[1].Payload, wantP)
+	}
+	if pkts[0].Timestamp >= pkts[1].Timestamp {
+		t.Fatalf("deferred P-frame timestamp did not follow IDR: %d then %d", pkts[0].Timestamp, pkts[1].Timestamp)
+	}
+}
+
+func TestStrictMissingIDRTailDropsKeyframeAndDeferredPFrames(t *testing.T) {
+	c := newTestClient(0x4000, "hd")
+	c.strict = true
+
+	mainData := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x99}
+	c.parseDatagram(makePkt(fragSpec{
+		channel: innerChMain, b1: 0x00,
+		subWire: 0x4000, totalFrags: 2, fragIdx: 0,
+		paylen: uint16(len(mainData)), frameNum: 100, payload: mainData,
+	}))
+	subEnd := makeTrailerPayload([]byte{0x77, 0x88, 0x99}, false, 0x01, 1500)
+	c.parseDatagram(makePkt(fragSpec{
+		channel: innerChSub, b1: 0x00,
+		subWire: 0x4001, totalFrags: 1, fragIdx: 0,
+		paylen: uint16(len(subEnd)), frameNum: 200, payload: subEnd,
+	}))
+	nextMain := []byte{0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB}
+	c.parseDatagram(makePkt(fragSpec{
+		channel: innerChMain, b1: 0x00,
+		subWire: 0x4002, totalFrags: 2, fragIdx: 0,
+		paylen: uint16(len(nextMain)), frameNum: 101, payload: nextMain,
+	}))
+
+	if pkts := drainAll(c); len(pkts) != 0 {
+		t.Fatalf("emitted %d packets after missing IDR tail in strict mode, want 0", len(pkts))
+	}
+	if !c.gopPoisoned {
+		t.Fatalf("gopPoisoned=false after strict-mode IDR tail loss")
+	}
+	if c.stats.vidDropped.Load() == 0 {
+		t.Fatalf("vidDropped=0 after strict-mode IDR tail loss")
+	}
+}
+
+func TestContiguousAckExtIgnoresHighWaterGaps(t *testing.T) {
+	c := newTestClient(0x4000, "hd")
+	c.avNextExt = 0x4001
+	c.avHighExt = 0x4008
+
+	ackExt, ok := c.contiguousAckExt()
+	if !ok {
+		t.Fatalf("contiguousAckExt returned ok=false")
+	}
+	if ackExt != 0x4000 {
+		t.Fatalf("ackExt=0x%x, want last contiguous 0x4000 despite high-water 0x4008", ackExt)
 	}
 }
 
@@ -708,5 +751,26 @@ func TestPaylenTruncatesPadding(t *testing.T) {
 	want := []byte{0xAA, 0xBB, 0xCC, 0xDD, 0x99, 0x88, 0x77, 0x66, 0x55}
 	if string(pkts[0].Payload) != string(want) {
 		t.Fatalf("payload=%x, want %x (padding past paylen=4 trimmed)", pkts[0].Payload, want)
+	}
+}
+
+func TestMalformedPaylenDropsPayload(t *testing.T) {
+	c := newTestClient(0x4000, "hd")
+
+	raw := []byte{0xAA, 0xBB, 0xCC, 0xDD}
+	c.parseDatagram(makePkt(fragSpec{
+		channel: innerChMain, b1: 0x00,
+		subWire: 0x4000, totalFrags: 2, fragIdx: 0,
+		paylen: 64, frameNum: 1, payload: raw,
+	}))
+	end := makeTrailerPayload([]byte{0x99, 0x88, 0x77}, true, 0x01, 1)
+	c.parseDatagram(makePkt(fragSpec{
+		channel: innerChMain, b1: 0x01, sub17: 0x01,
+		subWire: 0x4001, totalFrags: 2, fragIdx: 1,
+		paylen: uint16(len(end)), frameNum: 1, payload: end,
+	}))
+
+	if pkts := drainAll(c); len(pkts) != 0 {
+		t.Fatalf("emitted %d packets after malformed paylen, want 0", len(pkts))
 	}
 }

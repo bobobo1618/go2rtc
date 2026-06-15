@@ -174,12 +174,27 @@ func (c *Client) maintenanceLoop() {
 		case <-alive.C:
 			_ = c.send(buildAliveC2D(c.nonce))
 		case <-ack.C:
-			tw := uint16(c.avHighExt & 0xFFFF)
-			if tw != c.avPrevSubWire && c.avHighExt >= 0x4000 {
+			ackExt, ok := c.contiguousAckExt()
+			if !ok {
+				continue
+			}
+			tw := uint16(ackExt & 0xFFFF)
+			if tw != c.avPrevSubWire {
 				_ = c.sendInner(innerAck(c.icounter, c.avPrevSubWire, tw, 3, 0x34, tick16()))
 				c.icounter++
 				c.avPrevSubWire = tw
 			}
 		}
 	}
+}
+
+func (c *Client) contiguousAckExt() (uint64, bool) {
+	if c.avNextExt == 0 {
+		return 0, false
+	}
+	ackExt := c.avNextExt - 1
+	if ackExt < 0x4000 {
+		return 0, false
+	}
+	return ackExt, true
 }

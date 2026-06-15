@@ -20,7 +20,16 @@ import (
 // P-frames) time-multiplexed in wire order.  The two-channel + trailer-
 // based reassembler in this file has no tutk analog.
 
-const forceDrainStallTicks = 5 // ~500 ms with the 100 ms forceDrain cadence
+const (
+	forceDrainStallTicks = 5 // ~500 ms with the 100 ms forceDrain cadence
+	maxDeferredVideoAUs  = 64
+)
+
+type deferredVideoAU struct {
+	payload []byte
+	ts      uint32
+	haveTs  bool
+}
 
 type pendingFrag struct {
 	channel byte
@@ -99,11 +108,14 @@ func (c *Client) parseDatagram(pkt []byte) {
 	// those into the stream synthesises spurious H.264 start codes that
 	// the decoder rejects.  Only use paylen when it's non-zero AND fits.
 	paylen := binary.LittleEndian.Uint16(inner[24:])
-	sliceWithPaylen := func(start int) []byte {
+	sliceWithPaylen := func(start int) ([]byte, bool) {
 		if paylen != 0 && start+int(paylen) <= len(inner) {
-			return inner[start : start+int(paylen)]
+			return inner[start : start+int(paylen)], true
 		}
-		return inner[start:]
+		if paylen == 0 {
+			return inner[start:], true
+		}
+		return nil, false
 	}
 
 	var (
@@ -121,7 +133,11 @@ func (c *Client) parseDatagram(pkt []byte) {
 		if paylen == 0 {
 			return
 		}
-		payload = sliceWithPaylen(36)
+		var ok bool
+		payload, ok = sliceWithPaylen(36)
+		if !ok {
+			return
+		}
 	case (channel == innerChMain || channel == innerChSub) &&
 		b1 == 0x01 && sub17 == 0x01:
 		// END-FRAGMENT of a multi-fragment AV frame.
@@ -140,19 +156,39 @@ func (c *Client) parseDatagram(pkt []byte) {
 		//     lost — forcing subsequent frames onto the
 		//     lastEmitTs+1 fallback and producing tiny PTS deltas
 		//     that confuse ffmpeg's reorder buffer.
-		payload = sliceWithPaylen(36)
+		if paylen == 0 {
+			return
+		}
+		var ok bool
+		payload, ok = sliceWithPaylen(36)
+		if !ok {
+			return
+		}
 	case channel == innerChAudio && sub17 == 0x01 &&
 		len(inner) >= 38 && inner[36] == 0xFF && inner[37] == 0xF1:
 		// Audio variant (b): ADTS at offset 36, channel 0x03.
+		if paylen == 0 {
+			return
+		}
 		isAudio = true
-		payload = sliceWithPaylen(36)
+		var ok bool
+		payload, ok = sliceWithPaylen(36)
+		if !ok {
+			return
+		}
 	case channel == innerChSub && sub17 == 0x00 && b1 == 0x0d &&
 		len(inner) >= 46 && inner[44] == 0xFF && inner[45] == 0xF1:
 		// Audio variant (a): 8-byte inner header before ADTS sync,
 		// carried on the sub_video channel.  Strip the 8 header
 		// bytes so the producer sees clean ADTS.
+		if paylen == 0 {
+			return
+		}
 		isAudio = true
-		full := sliceWithPaylen(36)
+		full, ok := sliceWithPaylen(36)
+		if !ok {
+			return
+		}
 		if len(full) > 8 {
 			payload = full[8:]
 		} else {
@@ -364,9 +400,6 @@ func (c *Client) emit(e *pendingFrag) {
 			c.stats.fragSkips.Add(1)
 			c.stats.fragsLost.Add(1)
 			c.stats.vidDropped.Add(1)
-			if c.strict {
-				c.gopPoisoned = true
-			}
 			asm.reset()
 		}
 	}
@@ -381,12 +414,6 @@ func (c *Client) emit(e *pendingFrag) {
 	}
 	if asm.curAUTotal == 0 && e.totalFrags != 0 {
 		asm.curAUTotal = e.totalFrags
-	}
-
-	// ch=0x07 arrival: flush any pending ch=0x05 IDR first (its end
-	// fragment never came on this firmware), then process this P-frame.
-	if e.channel == innerChSub && c.mainAsm.framePending && len(c.mainAsm.buf) > 0 {
-		c.flushMainIDR(frameTs)
 	}
 
 	if !hasTrailer {
@@ -429,6 +456,9 @@ func (c *Client) emit(e *pendingFrag) {
 		log.Trace().Msgf("dual-stream interleave: ch=0x%02x frame=%d got stream-id=0x%02x want=0x%02x — dropping AU", e.channel, e.frameNum, trailerStreamID, wantStreamID)
 		c.stats.vidDropped.Add(1)
 		asm.reset()
+		if e.channel == innerChMain {
+			c.dropDeferredVideo()
+		}
 		return
 	}
 
@@ -459,6 +489,9 @@ func (c *Client) emit(e *pendingFrag) {
 		if c.strict && e.channel == innerChMain {
 			c.gopPoisoned = true
 		}
+		if e.channel == innerChMain {
+			c.dropDeferredVideo()
+		}
 		return
 	}
 
@@ -477,6 +510,9 @@ func (c *Client) emit(e *pendingFrag) {
 		if c.strict {
 			c.gopPoisoned = true
 			c.stats.vidDropped.Add(1)
+			if e.channel == innerChMain {
+				c.dropDeferredVideo()
+			}
 			return
 		}
 		// Non-strict mode (default), per channel:
@@ -532,11 +568,13 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 	}
 	au := append([]byte(nil), c.mainAsm.buf...)
 	midGapped := c.mainAsm.curAUGapped
-	tailMissing := false
+	tailMissing := true
 	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount+1 < c.mainAsm.curAUTotal {
-		tailMissing = true
 		c.stats.fragSkips.Add(1)
 		c.stats.fragsLost.Add(uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount))
+	} else {
+		c.stats.fragSkips.Add(1)
+		c.stats.fragsLost.Add(1)
 	}
 	c.mainAsm.reset()
 	if c.strict && (midGapped || tailMissing) {
@@ -546,9 +584,10 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 		// are dropped until the next clean IDR.
 		c.gopPoisoned = true
 		c.stats.vidDropped.Add(1)
+		c.dropDeferredVideo()
 		return
 	}
-	if midGapped {
+	if midGapped || tailMissing {
 		// Non-strict: emit the partial IDR anyway.  ffmpeg will show
 		// macroblock artefacts at the gap location for ~50 P-frames
 		// until the next clean IDR arrives — visibly noisy but vastly
@@ -556,7 +595,6 @@ func (c *Client) flushMainIDR(nextPFrameTs uint32) {
 		// IDR would produce.
 		c.stats.vidDropped.Add(1)
 	}
-	_ = tailMissing
 	// Guard the unsigned underflow: the camera clock at boot starts
 	// near zero, and a P-frame whose ts is < 40 ms would naively
 	// produce nextPFrameTs - 40 = ~0xFFFFFFC0 and lock the rest of
@@ -573,7 +611,21 @@ func (c *Client) emitAU(au []byte) {
 	if len(au) < 5 {
 		return
 	}
+	frameTs := c.pendingFrameTs
+	haveFrameTs := c.havePendingTs
+	c.havePendingTs = false
+
 	isKey := annexbContainsNALType(au, h264.NALUTypeIFrame)
+	if !isKey && c.mainAsm.framePending && len(c.mainAsm.buf) > 0 {
+		c.deferVideoAU(au, frameTs, haveFrameTs)
+		return
+	}
+	if c.emitVideoAU(au, isKey, frameTs, haveFrameTs) && isKey {
+		c.flushDeferredVideo(frameTs, haveFrameTs)
+	}
+}
+
+func (c *Client) emitVideoAU(au []byte, isKey bool, frameTs uint32, haveFrameTs bool) bool {
 	if isKey {
 		// A fresh IDR clears the GOP-poisoned state.
 		c.gopPoisoned = false
@@ -581,7 +633,7 @@ func (c *Client) emitAU(au []byte) {
 		// Strict only: drop P-frames referencing a dropped IDR.
 		// Non-strict lets the decoder conceal.
 		c.stats.vidDropped.Add(1)
-		return
+		return false
 	}
 
 	// PTS comes from the camera's own millisecond clock embedded in
@@ -590,16 +642,15 @@ func (c *Client) emitAU(au []byte) {
 	// wall-clock derived PTS produced "Invalid video timestamp X -> X"
 	// duplicates in mpv because multiple AUs flushed within one ms.
 	var pts uint32
-	if c.havePendingTs {
+	if haveFrameTs {
 		if !c.haveFirstTs {
-			c.firstFrameTs = c.pendingFrameTs
+			c.firstFrameTs = frameTs
 			c.haveFirstTs = true
 		}
 		// Frame counter is u32 LE ms; subtract origin and convert to
 		// the H.264 90 kHz clock.  Wrap-safe via unsigned subtraction.
-		ms := c.pendingFrameTs - c.firstFrameTs
+		ms := frameTs - c.firstFrameTs
 		pts = ms * 90
-		c.havePendingTs = false
 	} else {
 		// No trailer seen yet (early packets before the first frame
 		// finishes) or the trailer for this AU was lost — fall back
@@ -623,6 +674,43 @@ func (c *Client) emitAU(au []byte) {
 	})
 	c.emitSeq++
 	c.stats.vidFramesOut.Add(1)
+	return true
+}
+
+func (c *Client) deferVideoAU(au []byte, frameTs uint32, haveFrameTs bool) {
+	if len(c.deferredVideo) >= maxDeferredVideoAUs {
+		c.stats.vidDropped.Add(1)
+		return
+	}
+	c.deferredVideo = append(c.deferredVideo, deferredVideoAU{
+		payload: append([]byte(nil), au...),
+		ts:      frameTs,
+		haveTs:  haveFrameTs,
+	})
+}
+
+func (c *Client) flushDeferredVideo(keyTs uint32, haveKeyTs bool) {
+	if len(c.deferredVideo) == 0 {
+		return
+	}
+	deferred := c.deferredVideo
+	c.deferredVideo = nil
+	for _, d := range deferred {
+		if haveKeyTs && d.haveTs && d.ts <= keyTs {
+			c.stats.vidDropped.Add(1)
+			continue
+		}
+		isKey := annexbContainsNALType(d.payload, h264.NALUTypeIFrame)
+		c.emitVideoAU(d.payload, isKey, d.ts, d.haveTs)
+	}
+}
+
+func (c *Client) dropDeferredVideo() {
+	if len(c.deferredVideo) == 0 {
+		return
+	}
+	c.stats.vidDropped.Add(uint64(len(c.deferredVideo)))
+	c.deferredVideo = nil
 }
 
 // stripFragmentMetadataTrailer removes the 16-byte per-frame metadata

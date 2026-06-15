@@ -102,13 +102,14 @@ type Client struct {
 	done      chan struct{}
 	closeOnce sync.Once
 
-	audio       bool
-	quality     string
-	strict      bool
-	verbose     bool
-	mainAsm     channelAsm // per-channel assembly state for ch=0x05
-	subAsm      channelAsm // per-channel assembly state for ch=0x07
-	gopPoisoned bool       // strict mode only: a fragment was lost in this GOP — drop P-frames until next clean IDR
+	audio         bool
+	quality       string
+	strict        bool
+	verbose       bool
+	mainAsm       channelAsm // per-channel assembly state for ch=0x05
+	subAsm        channelAsm // per-channel assembly state for ch=0x07
+	gopPoisoned   bool       // strict mode only: a fragment was lost in this GOP — drop P-frames until next clean IDR
+	deferredVideo []deferredVideoAU
 
 	// Camera-clock PTS state.  pendingFrameTs is the millisecond value
 	// extracted from the most recently seen metadata trailer; it

@@ -2,7 +2,6 @@ package petlibro
 
 import (
 	"encoding/binary"
-	"fmt"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -158,15 +157,13 @@ func (c *Client) bootstrap() error {
 		pendingAck = pendingAck[:0]
 	}
 
-	// 3. AV-ready ack.  Validate that we actually observed the camera
-	// advance past the 0x3FFF control-channel watermark; if we never
-	// saw an AV-channel ACK (csub > 0x3FFF) above, bootstrapAVMax
-	// would still be the 0x3FFF default and the maintenance loop
-	// would never trigger its high-water ACK loop (gated by
-	// c.avHighExt >= 0x4000).  That's a silent stuck-stream failure
-	// mode worth catching at bootstrap time.
-	if bootstrapAVMax < 0x3FFF {
-		return fmt.Errorf("petlibro: bootstrap got AVMax=0x%04x, want >=0x3FFF — camera didn't ack any AV channel", bootstrapAVMax)
+	// 3. AV-ready ack.  Some cameras do not surface an AV-channel ack
+	// during this short bootstrap window even though they start sending
+	// AV fragments immediately afterward.  Fall back to the first AV
+	// sequence value instead of failing startup.
+	observedAV := bootstrapAVMax > 0x3FFF
+	if !observedAV {
+		log.Debug().Msgf("petlibro: bootstrap did not observe AV-channel ack before start; falling back to AV seq 0x4000")
 	}
 	if err := c.sendInner(innerAck(c.icounter, 0x3FFF, bootstrapAVMax, 3, 0x34, tick16())); err != nil {
 		return err
@@ -174,10 +171,10 @@ func (c *Client) bootstrap() error {
 	c.icounter++
 
 	c.avPrevSubWire = bootstrapAVMax
-	if bootstrapAVMax == 0x3FFF {
-		c.wrap = wrapSeq{ext: 0x4000}
-	} else {
+	if observedAV {
 		c.wrap = wrapSeq{ext: uint64(bootstrapAVMax) + 1}
+	} else {
+		c.wrap = wrapSeq{ext: 0x4000}
 	}
 	c.avNextExt = c.wrap.ext
 	c.avHighExt = c.wrap.ext - 1
