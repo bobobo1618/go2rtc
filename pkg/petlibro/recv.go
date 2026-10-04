@@ -58,16 +58,14 @@ func (c *Client) recvLoop() {
 			// fall through to periodic work below
 		}
 
-		// Shorter forceDrain interval — the camera (over LAN) has
-		// usually retransmitted lost packets within ~50-100 ms or
-		// they're not coming at all.  Holding longer just adds
-		// rendering latency without recovering more data.
-		if time.Since(lastForce) > 100*time.Millisecond {
+		// Service independent per-gap deadlines with a 20 ms timer granularity.
+		if time.Since(lastForce) > 20*time.Millisecond {
 			c.forceDrain()
 			lastForce = time.Now()
 		}
 		if c.verbose && time.Since(lastStats) > 5*time.Second {
 			c.dumpStats()
+			c.dumpV2()
 			lastStats = time.Now()
 		}
 	}
@@ -79,6 +77,7 @@ func (c *Client) recvLoop() {
 // many at once.
 func (c *Client) readerGoroutine(out chan<- []byte) {
 	defer close(out)
+	var lastArrival time.Time
 	for {
 		select {
 		case <-c.done:
@@ -98,12 +97,22 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 		if n == 0 {
 			continue
 		}
+		now := time.Now()
+		if !lastArrival.IsZero() {
+			gap := uint64(now.Sub(lastArrival).Microseconds())
+			for old := c.stats.maxRxGapUS.Load(); gap > old; old = c.stats.maxRxGapUS.Load() {
+				if c.stats.maxRxGapUS.CompareAndSwap(old, gap) {
+					break
+				}
+			}
+		}
+		lastArrival = now
 		select {
 		case <-c.done:
 			return
 		case out <- buf[:n]:
 		default:
-			// Processor is behind by 1024 packets.  Drop the new
+			// Processor is behind by 4096 packets.  Drop the new
 			// one rather than block the reader and let the kernel
 			// drop instead — the inner cmd counter / frag_idx gap
 			// detection will mark the resulting AU as incomplete.
@@ -116,6 +125,7 @@ func (c *Client) readerGoroutine(out chan<- []byte) {
 // the client is in verbose mode.  Numbers cover the most recent
 // interval; the cumulative counters are also visible.
 func (c *Client) dumpStats() {
+	log.Debug().Msgf("arrival: maxUDPGapMs=%.3f", float64(c.stats.maxRxGapUS.Swap(0))/1000)
 	cur := c.stats.snapshot()
 	delta := cur
 	if c.havePrevStats {
@@ -179,7 +189,7 @@ func (c *Client) maintenanceLoop() {
 				continue
 			}
 			tw := uint16(ackExt & 0xFFFF)
-			if tw != c.avPrevSubWire {
+			if tw != c.avPrevSubWire || c.ackPending.Load() {
 				_ = c.sendInner(innerAck(c.icounter, c.avPrevSubWire, tw, 3, 0x34, tick16()))
 				c.icounter++
 				c.avPrevSubWire = tw
@@ -189,12 +199,6 @@ func (c *Client) maintenanceLoop() {
 }
 
 func (c *Client) contiguousAckExt() (uint64, bool) {
-	if c.avNextExt == 0 {
-		return 0, false
-	}
-	ackExt := c.avNextExt - 1
-	if ackExt < 0x4000 {
-		return 0, false
-	}
-	return ackExt, true
+	ack := c.ackPublished.Load()
+	return ack, ack >= 0x4000
 }

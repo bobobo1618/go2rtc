@@ -70,10 +70,22 @@ type Packet struct {
 
 // Client is one LAN session against a Petlibro camera.
 type Client struct {
-	conn  *net.UDPConn
-	cam   *net.UDPAddr
-	uid   string
-	nonce []byte
+	fec           fecState
+	recovery      recoveryState
+	ackPublished  atomic.Uint64
+	ackPending    atomic.Bool
+	playGrace     time.Duration
+	idrGrace      time.Duration
+	ackGrace      time.Duration
+	clock         videoClock
+	now           func() time.Time // optional deterministic clock for regression tests
+	v2            v2Counters
+	prevV2        v2Counters
+	unknownLogged int
+	conn          *net.UDPConn
+	cam           *net.UDPAddr
+	uid           string
+	nonce         []byte
 
 	kseq     uint16 // outer kalay seq (byte 6..7)
 	icounter uint16 // inner cmd counter (byte 4..5)
@@ -91,12 +103,7 @@ type Client struct {
 	emitAudioSeq uint32
 	startedAt    time.Time
 
-	// frames carries assembled AUs to the consumer.  done is closed
-	// by Close() to signal every worker goroutine to exit; we select
-	// on it instead of carrying a separate closed-bool + mutex +
-	// recover() dance.  Closing done first means the
-	// send-on-closed-frames race is structurally impossible — every
-	// caller writing to frames first selects on done.
+	// done broadcasts shutdown; frames is deliberately never closed.
 	frames    chan *Packet
 	done      chan struct{}
 	closeOnce sync.Once
@@ -123,14 +130,6 @@ type Client struct {
 	stats         counters
 	prevStats     countersSnapshot
 	havePrevStats bool
-
-	// forceDrain stall tracking.  If avHighExt hasn't advanced for
-	// forceDrainStallTicks consecutive force-drain ticks and the
-	// buffer is non-empty, we flush regardless of the high-water
-	// threshold — recovers from a stalled camera leaving partial AUs
-	// stranded forever.
-	stallTicks  uint8
-	lastHighExt uint64
 }
 
 // counters holds running totals for a stream-health summary. Atomic
@@ -138,6 +137,7 @@ type Client struct {
 // recvTimeouts/readerDrops while the processor writes every other
 // field — plain uint64 access would trip `go test -race`.
 type counters struct {
+	maxRxGapUS   atomic.Uint64 // interval maximum UDP arrival gap, reader-owned updates
 	bytesIn      atomic.Uint64 // bytes read from the UDP socket (encrypted)
 	pktsIn       atomic.Uint64 // UDP datagrams successfully read
 	mainFrags    atomic.Uint64 // fragments on the main video channel (ch=0x05, IDR-bearing)
@@ -213,11 +213,9 @@ func (c *counters) snapshot() countersSnapshot {
 //	petlibro://<host>?uid=<UID>[&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 //	petlibro://?uid=<UID>[&subnet=192.168.1.0/24][&audio=true][&quality=hd|sd][&strict=1][&verbose=1]
 //
-//	strict=1 — drop any IDR with a fragment loss and poison the GOP
-//	           (pristine pixels at the cost of multi-second freezes
-//	           on lossy networks).  Default is to emit gapped IDRs
-//	           with localised macroblock artefacts and drop gapped
-//	           P-frames (avoids cascading inter-frame errors).
+// strict=1 also suppresses dependent P-frames after a damaged P AU.
+// Both modes always discard incomplete IDRs and suppress their dependants.
+// Recovery options: reorder_ms=120, idr_grace_ms=350, ack_grace_ms=1000.
 //
 // Matches the project-wide Dial(rawURL string) (*Client, error)
 // signature used by every other UDP/TCP camera adapter — see
@@ -318,6 +316,28 @@ func Dial(rawURL string) (*Client, error) {
 		frames:  make(chan *Packet, 1024),
 		done:    make(chan struct{}),
 	}
+	for _, option := range []struct {
+		key      string
+		dst      *time.Duration
+		fallback int
+	}{
+		{"reorder_ms", &c.playGrace, 120}, {"idr_grace_ms", &c.idrGrace, 350}, {"ack_grace_ms", &c.ackGrace, 1000},
+	} {
+		ms := option.fallback
+		if value := q.Get(option.key); value != "" {
+			parsed, parseErr := strconv.Atoi(value)
+			if parseErr != nil || parsed < 20 || parsed > 5000 {
+				_ = udp.Close()
+				return nil, fmt.Errorf("petlibro: %s must be 20..5000 ms", option.key)
+			}
+			ms = parsed
+		}
+		*option.dst = time.Duration(ms) * time.Millisecond
+	}
+	if c.idrGrace < c.playGrace || c.ackGrace <= c.idrGrace {
+		_ = udp.Close()
+		return nil, fmt.Errorf("petlibro: require reorder_ms <= idr_grace_ms < ack_grace_ms")
+	}
 	if err := c.handshake(); err != nil {
 		clearDiscoveryCache(uid, q["subnet"])
 		_ = udp.Close()
@@ -408,21 +428,12 @@ func (c *Client) ReadPacket() (*Packet, error) {
 	}
 }
 
-// Close shuts the session down.  closeOnce.Do(close(done) +
-// conn.Close() + close(frames)) — closing done before frames means
-// every goroutine selecting on done (recvLoop, readerGoroutine,
-// maintenanceLoop, queuePacket, ReadPacket) drops out before we touch
-// the frames channel they were writing to, so the
-// send-on-closed-channel race is structurally impossible.  Investigated
-// pkg/wyze (closeMu+bool), pkg/tapo / pkg/dvrip (bare conn.Close()),
-// and pkg/onvif (no Close).  None of those use a done channel today,
-// but for a multi-goroutine UDP client this is the simpler, mutex-free
-// equivalent of wyze's pattern.
+// Close signals all workers and closes the socket. frames stays open so an
+// in-flight queue send cannot panic; ReadPacket observes done and returns EOF.
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
 		_ = c.conn.Close()
-		close(c.frames)
 	})
 	return nil
 }

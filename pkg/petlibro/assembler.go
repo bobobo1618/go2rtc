@@ -2,7 +2,7 @@ package petlibro
 
 import (
 	"encoding/binary"
-	"slices"
+
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/h264"
@@ -21,8 +21,7 @@ import (
 // based reassembler in this file has no tutk analog.
 
 const (
-	forceDrainStallTicks = 5 // ~500 ms with the 100 ms forceDrain cadence
-	maxDeferredVideoAUs  = 64
+	maxDeferredVideoAUs = 64
 )
 
 type deferredVideoAU struct {
@@ -89,7 +88,24 @@ func (c *Client) parseDatagram(pkt []byte) {
 	if inner[0] != 0x0c {
 		return
 	}
+	c.handleFEC(inner)
 	b1 := inner[1]
+	// Firmware 3.1.54 sends 0x08/0x09/0x0d transport headers with
+	// eight extra bytes before the AV header. They are NOT different
+	// media channels. Normalize the fixed header so all fragment fields
+	// (including sequence and payload length) use the same offsets.
+	legacyAudio := b1 == 0x0d && len(inner) >= 46 && inner[16] == innerChSub && inner[17] == 0 && inner[44] == 0xff && inner[45] == 0xf1
+	if !legacyAudio && (b1 == 0x08 || b1 == 0x09 || b1 == 0x0d) {
+		if len(inner) < 44 {
+			return
+		}
+		normalized := make([]byte, len(inner)-8)
+		copy(normalized, inner[:16])
+		copy(normalized[16:], inner[24:])
+		inner = normalized
+		b1 &^= 0x08
+		c.v2.extended++
+	}
 	channel := inner[16] // low byte of bytes16..17
 	sub17 := inner[17]
 	subWire := binary.LittleEndian.Uint16(inner[18:])
@@ -195,6 +211,10 @@ func (c *Client) parseDatagram(pkt []byte) {
 			payload = nil
 		}
 	default:
+		if c.verbose && c.unknownLogged < 20 {
+			log.Debug().Msgf("unclassified ch=%02x sub17=%02x b1=%02x seq=%04x len=%d header=%x", channel, sub17, b1, subWire, len(inner), inner[:min(96, len(inner))])
+			c.unknownLogged++
+		}
 		return
 	}
 
@@ -219,6 +239,7 @@ func (c *Client) parseDatagram(pkt []byte) {
 		c.stats.otherFrags.Add(1)
 		return
 	}
+	c.receiveSequence(subExt, c.timeNow())
 	if subExt > c.avHighExt {
 		c.avHighExt = subExt
 		c.wrap.advanceTo(subWire)
@@ -249,57 +270,6 @@ func (c *Client) drainContiguous() {
 		delete(c.avBuffer, c.avNextExt)
 		c.avNextExt++
 		c.emit(e)
-	}
-}
-
-// forceDrain flushes any avBuffer entries that have fallen too far
-// behind the current high-water mark — the missing packet that would
-// have filled the contiguous slot is presumed lost.  If avHighExt
-// hasn't moved across forceDrainStallTicks consecutive ticks AND the
-// buffer is non-empty, we flush EVERYTHING regardless of the
-// high-water threshold — recovers from a stalled camera leaving
-// partial AUs stranded forever.
-func (c *Client) forceDrain() {
-	if len(c.avBuffer) == 0 {
-		c.stallTicks = 0
-		c.lastHighExt = c.avHighExt
-		return
-	}
-	if c.avHighExt == c.lastHighExt {
-		c.stallTicks++
-	} else {
-		c.stallTicks = 0
-		c.lastHighExt = c.avHighExt
-	}
-	stalled := c.stallTicks >= forceDrainStallTicks
-
-	threshold := c.avHighExt
-	if !stalled {
-		if threshold < 8 {
-			return
-		}
-		threshold -= 8
-	}
-
-	var keys []uint64
-	for k := range c.avBuffer {
-		if stalled || k <= threshold {
-			keys = append(keys, k)
-		}
-	}
-	if len(keys) == 0 {
-		return
-	}
-	c.stats.forceDrains.Add(1)
-	slices.Sort(keys)
-	for _, k := range keys {
-		e := c.avBuffer[k]
-		delete(c.avBuffer, k)
-		c.avNextExt = k + 1
-		c.emit(e)
-	}
-	if stalled {
-		c.stallTicks = 0
 	}
 }
 
@@ -385,14 +355,7 @@ func (c *Client) emit(e *pendingFrag) {
 		asm = &c.subAsm
 	}
 
-	// Frame_num change on THIS channel without having seen the
-	// previous frame's end-fragment.  For ch=0x05 this is normally a
-	// back-to-back IDR where the previous IDR's end-fragment was lost
-	// AND the cross-channel ch=0x07 flush below didn't fire — try to
-	// emit the partial previous IDR via flushMainIDR rather than
-	// silently drop it (it might still be decodable with localised
-	// artefacts).  For ch=0x07 it means a P-frame was abandoned mid-
-	// assembly; just reset and count it as a drop.
+	// A new frame on this channel abandons an incomplete predecessor.
 	if asm.framePending && e.frameNum != asm.curFrameNum && len(asm.buf) > 0 {
 		if e.channel == innerChMain {
 			c.flushMainIDR(0)
@@ -400,6 +363,7 @@ func (c *Client) emit(e *pendingFrag) {
 			c.stats.fragSkips.Add(1)
 			c.stats.fragsLost.Add(1)
 			c.stats.vidDropped.Add(1)
+			c.v2.pDrops++
 			asm.reset()
 		}
 	}
@@ -486,8 +450,11 @@ func (c *Client) emit(e *pendingFrag) {
 		c.stats.fragsLost.Add(uint64(expectedData))
 		c.stats.vidDropped.Add(1)
 		asm.reset()
-		if c.strict && e.channel == innerChMain {
+		if e.channel == innerChMain {
 			c.gopPoisoned = true
+			c.v2.idrDrops++
+		} else {
+			c.v2.pDrops++
 		}
 		if e.channel == innerChMain {
 			c.dropDeferredVideo()
@@ -506,36 +473,18 @@ func (c *Client) emit(e *pendingFrag) {
 	asm.reset()
 
 	if gapped {
-		// Strict mode: drop the entire GOP for pristine pixels.
-		if c.strict {
-			c.gopPoisoned = true
-			c.stats.vidDropped.Add(1)
-			if e.channel == innerChMain {
-				c.dropDeferredVideo()
-			}
-			return
-		}
-		// Non-strict mode (default), per channel:
-		//   * IDR on ch=0x05: emit the partial frame.  A slice with a
-		//     mid-frame hole still gives the decoder SOMETHING to
-		//     reference for the next ~25-50 P-frames, and macroblock
-		//     artefacts at the hole location are far less disruptive
-		//     than the multi-second freeze that results from dropping
-		//     the IDR and waiting for the next clean one.
-		//   * P-frame on ch=0x07: DROP.  A truncated P-frame slice
-		//     causes the decoder to mis-parse the bitstream mid-way
-		//     and the resulting errors ("mb_type 533 in I slice too
-		//     large", "P sub_mb_type 11 out of range", etc) cascade
-		//     into every subsequent P-frame in the GOP via reference
-		//     prediction.  The decoder recovers automatically at the
-		//     next clean P-frame (P-frames only reference the IDR,
-		//     not each other for slice-data validity), so dropping
-		//     ONE gapped P-frame loses one frame; emitting it loses
-		//     the rest of the GOP to cascading decoder errors.
 		c.stats.vidDropped.Add(1)
-		if e.channel != innerChMain {
-			return
+		if wasMain {
+			c.v2.idrDrops++
+			c.gopPoisoned = true
+			c.dropDeferredVideo()
+		} else {
+			c.v2.pDrops++
+			if c.strict {
+				c.gopPoisoned = true
+			}
 		}
+		return
 	}
 	c.pendingFrameTs = frameTs
 	c.havePendingTs = true
@@ -548,62 +497,17 @@ func (c *Client) emit(e *pendingFrag) {
 	c.emitAU(au)
 }
 
-// flushMainIDR emits the accumulated ch=0x05 IDR buffer in the
-// fallback case where we never received its b1=0x01 sub17=0x01
-// end-fragment — either it was lost on the wire, or this camera
-// firmware variant doesn't send one and we noticed an unrelated
-// cross-channel signal (a ch=0x07 P-frame arrival, or a new ch=0x05
-// frame_num) telling us the IDR is "as complete as it'll get".  The
-// missing end-fragment carries the slice's bottom MB rows plus the
-// rbsp_trailing_bits stop byte, so the AU we have is truncated; the
-// decoder will show macroblock artefacts in the bottom strip.
-//
-// Strict mode (?strict=1) drops the truncated IDR and poisons the
-// GOP — pristine pixels at the cost of a multi-second freeze until
-// the next clean IDR.  Non-strict mode (default) emits it anyway.
-func (c *Client) flushMainIDR(nextPFrameTs uint32) {
-	if len(c.mainAsm.buf) == 0 {
-		c.mainAsm.reset()
-		return
-	}
-	au := append([]byte(nil), c.mainAsm.buf...)
-	midGapped := c.mainAsm.curAUGapped
-	tailMissing := true
-	if c.mainAsm.curAUTotal > 0 && c.mainAsm.curAUDataCount+1 < c.mainAsm.curAUTotal {
-		c.stats.fragSkips.Add(1)
-		c.stats.fragsLost.Add(uint64(c.mainAsm.curAUTotal - 1 - c.mainAsm.curAUDataCount))
-	} else {
-		c.stats.fragSkips.Add(1)
+// flushMainIDR discards an incomplete IDR. Its missing slice bytes cannot be
+// reconstructed; publishing it would contaminate subsequent reference frames.
+func (c *Client) flushMainIDR(_ uint32) {
+	if len(c.mainAsm.buf) > 0 {
+		c.stats.vidDropped.Add(1)
 		c.stats.fragsLost.Add(1)
+		c.v2.idrDrops++
 	}
 	c.mainAsm.reset()
-	if c.strict && (midGapped || tailMissing) {
-		// Strict mode: drop the IDR if anything was lost — pristine
-		// pixels over fluency.  Cascading inter-frame errors are
-		// avoided by also poisoning the GOP so subsequent P-frames
-		// are dropped until the next clean IDR.
-		c.gopPoisoned = true
-		c.stats.vidDropped.Add(1)
-		c.dropDeferredVideo()
-		return
-	}
-	if midGapped || tailMissing {
-		// Non-strict: emit the partial IDR anyway.  ffmpeg will show
-		// macroblock artefacts at the gap location for ~50 P-frames
-		// until the next clean IDR arrives — visibly noisy but vastly
-		// better than the multi-second video freeze that dropping the
-		// IDR would produce.
-		c.stats.vidDropped.Add(1)
-	}
-	// Guard the unsigned underflow: the camera clock at boot starts
-	// near zero, and a P-frame whose ts is < 40 ms would naively
-	// produce nextPFrameTs - 40 = ~0xFFFFFFC0 and lock the rest of
-	// the session's PTS into the wrap-around regime.
-	if nextPFrameTs >= 40 {
-		c.pendingFrameTs = nextPFrameTs - 40
-		c.havePendingTs = true
-	}
-	c.emitAU(au)
+	c.gopPoisoned = true
+	c.dropDeferredVideo()
 }
 
 // emitAU finalises one access unit and queues it for the consumer.
@@ -629,42 +533,17 @@ func (c *Client) emitVideoAU(au []byte, isKey bool, frameTs uint32, haveFrameTs 
 	if isKey {
 		// A fresh IDR clears the GOP-poisoned state.
 		c.gopPoisoned = false
-	} else if c.strict && c.gopPoisoned {
-		// Strict only: drop P-frames referencing a dropped IDR.
-		// Non-strict lets the decoder conceal.
+	} else if c.gopPoisoned {
+		// No P-frame can safely reference an incomplete IDR.
 		c.stats.vidDropped.Add(1)
 		return false
 	}
 
-	// PTS comes from the camera's own millisecond clock embedded in
-	// the metadata trailer of each frame's last fragment.  This gives
-	// per-frame-accurate timestamps that survive forceDrain bursts —
-	// wall-clock derived PTS produced "Invalid video timestamp X -> X"
-	// duplicates in mpv because multiple AUs flushed within one ms.
-	var pts uint32
-	if haveFrameTs {
-		if !c.haveFirstTs {
-			c.firstFrameTs = frameTs
-			c.haveFirstTs = true
-		}
-		// Frame counter is u32 LE ms; subtract origin and convert to
-		// the H.264 90 kHz clock.  Wrap-safe via unsigned subtraction.
-		ms := frameTs - c.firstFrameTs
-		pts = ms * 90
-	} else {
-		// No trailer seen yet (early packets before the first frame
-		// finishes) or the trailer for this AU was lost — fall back
-		// to "just-after the last emitted PTS" so playback ordering
-		// stays monotonic and the AU doesn't collide with the prior
-		// one.
-		pts = c.lastEmitTs + 1
-	}
-	if pts <= c.lastEmitTs && c.lastEmitTs != 0 {
-		// Strictly monotonic — never re-use a previous PTS.
-		pts = c.lastEmitTs + 1
+	pts, interpolated := c.clock.timestamp(frameTs, haveFrameTs)
+	if interpolated {
+		c.v2.interpolated++
 	}
 	c.lastEmitTs = pts
-
 	c.queuePacket(&Packet{
 		Codec:      CodecH264,
 		Payload:    au,
@@ -795,9 +674,8 @@ func annexbContainsNALType(b []byte, want byte) bool {
 	return false
 }
 
-// queuePacket hands an assembled Packet to the consumer.  Selecting on
-// done first means Close cannot race the send onto the now-closed
-// frames channel — recover() and a separate closed-bool aren't needed.
+// queuePacket never closes frames; Close signals done and closes only the socket.
+// This avoids racing a producer send against a channel close.
 func (c *Client) queuePacket(p *Packet) {
 	select {
 	case <-c.done:
