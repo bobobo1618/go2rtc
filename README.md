@@ -1,3 +1,149 @@
+# PETLIBRO PLAF203 V2 - Experimental LAN Camera Support
+
+**Status: BETA / EXPERIMENTAL — community maintained.**
+
+This fork publishes PETLIBRO PLAF203 LAN H264/AAC transport and recovery fixes.
+It builds on [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc) and
+[bobobo1618's PETLIBRO integration](https://github.com/bobobo1618/go2rtc), from
+exact base `8fc5ef560d63dd2f5cf1bf299f18784d05eeba92` ("Fix Petlibro producer
+frame assembly"). The original go2rtc README is preserved below.
+
+**Tested:** PETLIBRO Granary Smart Camera Feeder **PLAF203**, firmware **3.1.54**,
+hardware **1.0.7**, GK7205V200 SoC, GK platform, Linux 4.9y. H264 HD 1920x1080 /
+SD 640x360 and AAC over LAN UDP using the TUTK/Kalay based implementation.
+H264 + AAC playback was confirmed together. These results concern one device.
+
+The stock PETLIBRO app and cloud remain available. No firmware modification,
+MQTT hijack, DNS hijack or cloud disabling is required.
+
+## Why V2 was needed
+
+- **Extended transport headers:** firmware 3.1.54 types `0x08`, `0x09`, `0x0d`
+  add eight bytes. Actual inner AV header/payload offsets are 24/44. V2
+  normalizes these fields instead of misreading extension bytes as channel and
+  sequence data, which previously caused discards and artificial gaps.
+- **ACK/playout separation:** playback can skip an expired gap without falsely
+  acknowledging its missing wire packet. Independent ACK grace and explicit
+  give-up counters bound the wait.
+- **FEC recovery:** channel `0x0c` is structured parity. Bounded GF(256)
+  single-erasure recovery activates only after three complete groups validate
+  byte-for-byte; a parity mismatch disables recovery for the session.
+- **IDR/GOP recovery:** incomplete IDRs are dropped; dependent P frames wait for
+  or recover with a clean IDR. Timestamp/reorder improvements use per-gap timers
+  and a rolling median nominal PTS interval instead of one-tick fallbacks.
+- **AAC:** existing AAC support is preserved across transport variants and
+  covered by regression tests; simultaneous H264 + AAC was validated live.
+
+## What OpenAI Codex changed
+
+During the V2 debugging/development process, the maintainer used OpenAI Codex to:
+
+- Reconstruct the exact upstream PETLIBRO commit and audit its implementation.
+- Demonstrate the ACK/playout frontier bug with a regression test.
+- Analyze real firmware 3.1.54 UDP transport, identify the `0x08` / `0x09` /
+  `0x0d` extended format and determine the AV header/payload offsets.
+- Analyze `0x0c` FEC/parity; implement bounded GF(256) erasure recovery gated
+  by byte-exact validation against real complete packet groups.
+- Separate ACK reception and playback state; develop time-based reorder/gap
+  recovery, improve IDR/GOP recovery and PTS interpolation.
+- Add detailed telemetry and unit/regression tests; compare baseline/V2 with
+  FFmpeg and perform RTSP smoke testing during the earlier device evaluation.
+
+These are contributions to a community experiment. AI assistance does not prove
+correctness, and neither OpenAI nor Codex endorses this fork. Earlier live tests
+and publication-time offline checks are distinguished in the technical report.
+
+## Configuration and RTSP
+
+Replace the placeholders with your values. Each device's UID is unique.
+No validated UID-extraction procedure is claimed here.
+
+```yaml
+streams:
+  petlibro:
+    - "petlibro://<CAMERA_IP>?uid=<PETLIBRO_UID>&audio=true&quality=hd&verbose=1&strict=0&reorder_ms=120&idr_grace_ms=350&ack_grace_ms=1000"
+```
+
+```text
+# H264 + AAC
+rtsp://<GO2RTC_HOST>:8554/petlibro?video=h264&audio=aac
+# Video only
+rtsp://<GO2RTC_HOST>:8554/petlibro?video=h264
+```
+
+`quality=hd` / `quality=sd` select an enabled camera stream; `audio=true` enables
+AAC. `strict=0` uses the default loss policy but still drops incomplete IDRs.
+`reorder_ms`, `idr_grace_ms`, and `ack_grace_ms` control normal gap, IDR gap and
+independent ACK grace. `verbose=1` enables diagnostics (debug log level is needed
+for debug messages). See the [configuration reference](docs/petlibro-plaf203-v2.md#configuration)
+for constraints and defaults.
+
+## Measured results and limitations
+
+Earlier single-device 90-second baseline/V2 comparison:
+
+| Metric | Baseline | V2 final |
+|---|---:|---:|
+| Frames / keyframes | 2059 / 81 | 2075 / 83 |
+| FPS | 22.878 | 23.055 |
+| FFmpeg decode error lines / macroblock errors | 58 / 29 | 0 / 0 |
+| PTS median / p95 (ms) | 40 / 80 | 40 / 40 |
+| Maximum observed PTS interval (ms) | 120 | 1040 |
+| `fragLost` / `forceDrain` | 105 / 181 | 16 / 8 |
+| FEC validated / recovered / invalid | — | 391 / 8 / 0 |
+
+The full [methodology, intermediate results and telemetry](docs/petlibro-plaf203-v2.md#test-methodology-and-measured-results)
+include the 30-second RTSP smoke test (exit 0, 730 frames, zero decode errors).
+Playback generally started quickly and was smooth, but rare approximately
+one-second glitches/distortion correlated with UDP gaps and IDR loss.
+
+**Normal reconnect succeeded:** the client closed, the on-demand upstream session
+closed, more than 75 seconds elapsed, then reopening successfully restarted the
+stream. A go2rtc restart was not required for every normal reconnect.
+
+**Known beta limitation:** changing runtime RTSP codec/source selection from
+`?video=h264` to `?video=h264&audio=aac` caused `probe timeout` in some tests;
+a clean go2rtc restart restored video+audio. No week-long soak test is complete,
+and other firmware versions or PETLIBRO models are unverified. Community
+feedback with sanitized diagnostics is welcome in this fork's issues.
+
+## Build, troubleshooting and privacy
+
+Using Go 1.24.13 from the repository root:
+
+```powershell
+go test ./pkg/petlibro
+go vet ./pkg/petlibro/...
+$env:GOOS = 'windows'
+$env:GOARCH = 'amd64'
+$env:CGO_ENABLED = '0'
+go build -trimpath -buildvcs=true -o go2rtc-petlibro-plaf203-v2-windows-amd64.exe .
+./go2rtc-petlibro-plaf203-v2-windows-amd64.exe -version
+```
+
+PETLIBRO tests/vet pass. The full `go test ./...` suite has unrelated inherited
+failures; [details and revision verification](docs/petlibro-plaf203-v2.md#build-and-publication-checks)
+are documented without modifying those modules. The app retains the upstream
+version family with a commit suffix; the V2 beta release tag identifies this fork.
+
+For timeouts check UID/IP, LAN reachability and runtime codec selection. For
+freezes inspect UDP gap, IDR loss, FEC and queue-drop counters. Keep UIDs,
+connection URLs, captures, credentials and raw logs private; verbose output
+may contain device identifiers. Use a trusted LAN and authenticated access,
+and do not expose unauthenticated API/RTSP listeners to the Internet.
+See [troubleshooting and privacy](docs/petlibro-plaf203-v2.md#troubleshooting-and-privacy).
+
+## Credits and license
+
+Credits: **AlexxIT/go2rtc and contributors**, **bobobo1618/go2rtc PETLIBRO work
+and contributors**, and **OpenAI Codex-assisted V2 debugging/development**.
+This is not an official OpenAI or PETLIBRO product. The original
+[MIT LICENSE](LICENSE) is preserved.
+
+---
+
+## Original go2rtc README
+
 <h1 align="center">
   <a href="https://github.com/AlexxIT/go2rtc">
     <img src="./website/images/logo.gif" alt="go2rtc - GitHub">
