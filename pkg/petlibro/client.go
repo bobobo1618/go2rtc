@@ -34,7 +34,6 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -279,8 +278,7 @@ func Dial(rawURL string) (*Client, error) {
 	if sc, err := udp.SyscallConn(); err == nil {
 		var actualBuf int
 		_ = sc.Control(func(fd uintptr) {
-			actualBuf, _ = syscall.GetsockoptInt(int(fd),
-				syscall.SOL_SOCKET, syscall.SO_RCVBUF)
+			actualBuf, _ = socketReceiveBuffer(fd)
 		})
 		// Linux SO_RCVBUF reports double the granted size (man 7
 		// socket); halve before comparing.
