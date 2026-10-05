@@ -22,3 +22,16 @@ website/.vitepress/dist
 node_modules
 package-lock.json
 CLAUDE.md
+
+# Private device configuration and local evaluation artifacts
+production.yaml
+isolated.yaml
+output.txt
+*.log
+*.pcap
+*.pcapng
+*.h264
+/captures/
+/temp/
+/.publication-tools/
+/go2rtc-petlibro-*.exe

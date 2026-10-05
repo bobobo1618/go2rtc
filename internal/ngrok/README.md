@@ -39,7 +39,7 @@ ngrok config example:
 
 ```yaml
 version: "2"
-authtoken: eW91IHNoYWxsIG5vdCBwYXNzCnlvdSBzaGFsbCBub3QgcGFzcw
+authtoken: <NGROK_AUTHTOKEN>
 tunnels:
   api:
     addr: 1984  # use the same port as in the go2rtc config

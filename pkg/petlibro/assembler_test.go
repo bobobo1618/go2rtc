@@ -670,6 +670,7 @@ func TestStrictMissingIDRTailDropsKeyframeAndDeferredPFrames(t *testing.T) {
 
 func TestContiguousAckExtIgnoresHighWaterGaps(t *testing.T) {
 	c := newTestClient(0x4000, "hd")
+	c.receiveSequence(0x4000, c.timeNow())
 	c.avNextExt = 0x4001
 	c.avHighExt = 0x4008
 
